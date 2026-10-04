@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "import_glue_pbr_baker"
+version = "1.3.0"
+name = "Import Glue PBR Baker"
+tagline = "Bake game-rip materials into Roblox-ready PBR maps"
+maintainer = "Sohra"
+type = "add-on"
+
+blender_version_min = "4.3.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read textures; write maps, reports, exports, and blend files"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/*.zip",
+]
