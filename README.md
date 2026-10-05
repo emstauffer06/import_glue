@@ -32,7 +32,8 @@ Requires Blender 4.3 or newer. The current release was verified on Blender 5.2.0
 
 ## Documentation
 
-The [full README](import_glue_pbr_baker/README.md) covers resolution settings, safety behavior, copy finalization, headless flags, and known engine limits.
+- **[Quick guide (PDF)](docs/import_glue_quick_guide.pdf):** a two-page visual walkthrough of installing the add-on, running a bake, how routes are chosen, and common fixes.
+- **[Full README](import_glue_pbr_baker/README.md):** resolution settings, safety behavior, copy finalization, headless flags, and known engine limits.
 
 ## License
 
