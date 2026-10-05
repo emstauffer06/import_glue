@@ -1,3 +1,5 @@
+![Import Glue PBR Baker: bake game-rip materials into Roblox-ready PBR maps](docs/banner.png)
+
 # Import Glue PBR Baker
 
 A Blender add-on that converts game-rip meshes into Roblox-ready meshes and PBR texture maps.
