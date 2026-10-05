@@ -17,13 +17,13 @@ from bpy.props import (
 from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup
 
-from . import engine, precheck
+from . import engine, material_capabilities, precheck
 
 
 bl_info = {
     "name": "Import Glue PBR Baker",
     "author": "Sohra",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 3, 0),
     "location": "3D Viewport > Sidebar > Roblox > Import Glue",
     "description": "Convert selected game-rip meshes into Roblox-ready PBR maps",
@@ -31,7 +31,7 @@ bl_info = {
 }
 
 
-ADDON_VERSION = "1.3.0"
+ADDON_VERSION = "1.4.0"
 ENGINE_CONFIG_KEYS = (
     "OUTPUT_ROOT",
     "RES",
@@ -42,6 +42,7 @@ ENGINE_CONFIG_KEYS = (
     "BAKE_DENSITY_SCALE",
     "DEVICE",
     "ALLOW_CPU_FALLBACK",
+    "ALLOW_APPROXIMATION",
     "SOURCE_DIRS",
     "ROUTE_MODE",
     "SOURCE_NORMAL_IS_DIRECTX",
@@ -49,10 +50,14 @@ ENGINE_CONFIG_KEYS = (
     "EXPORT_FBX",
     "AUTO_UNWRAP_NO_UV",
     "DONE_LIST",
+    "DURABLE_CHECKPOINTS",
     "TRI_BUDGET",
     "ENFORCE_TRI_BUDGET",
     "CROP_SPLIT_PREPASS",
     "FINALIZE_IN_SESSION",
+    "VISUAL_VALIDATION",
+    "VISUAL_VALIDATION_GATE",
+    "VISUAL_VALIDATION_SETTINGS",
 )
 
 
@@ -406,6 +411,7 @@ class EngineConfig:
             "BAKE_DENSITY_SCALE": float(settings.bake_density_scale),
             "DEVICE": settings.device,
             "ALLOW_CPU_FALLBACK": settings.allow_cpu_fallback,
+            "ALLOW_APPROXIMATION": settings.allow_approximation,
             "SOURCE_DIRS": _split_directories(settings.source_directories),
             "ROUTE_MODE": settings.route_mode,
             "SOURCE_NORMAL_IS_DIRECTX": settings.source_normal_is_directx,
@@ -413,10 +419,17 @@ class EngineConfig:
             "EXPORT_FBX": settings.export_fbx,
             "AUTO_UNWRAP_NO_UV": settings.auto_unwrap_no_uv,
             "DONE_LIST": settings.resume_enabled,
+            "DURABLE_CHECKPOINTS": settings.resume_enabled and settings.durable_checkpoints,
             "TRI_BUDGET": settings.triangle_budget,
             "ENFORCE_TRI_BUDGET": settings.enforce_triangle_budget,
             "CROP_SPLIT_PREPASS": settings.crop_split_prepass,
             "FINALIZE_IN_SESSION": settings.finalize_in_session,
+            "VISUAL_VALIDATION": settings.visual_validation,
+            "VISUAL_VALIDATION_GATE": settings.visual_validation and settings.visual_validation_gate,
+            "VISUAL_VALIDATION_SETTINGS": {"resolution": int(settings.visual_resolution),
+                                           "samples": int(settings.visual_samples),
+                                           "probe_resolution": ("auto" if settings.visual_probe == "AUTO"
+                                                                else int(settings.visual_probe))},
         }
         for name, value in values.items():
             setattr(engine, name, value)
@@ -479,6 +492,79 @@ def _set_status(
         settings.last_report = report
 
 
+CAPABILITY_REPORT_NAME = "material_capabilities.json"
+
+
+def _capability_preflight(settings: Any, objects: Iterable[Any]) -> Tuple[Dict[str, Any], str]:
+    """Read-only capability report beside the precheck report, plus panel text.
+
+    Returns (report, write_error).  It never changes routing, materials or
+    image paths; a report that cannot be written is said so, not hidden
+    (write_report raises only OSError, encoding failures included).
+    """
+    report = material_capabilities.preflight_report(
+        list(objects), engine.CAPABILITY_PROFILE, bool(settings.allow_approximation))
+    lines = material_capabilities.summary_lines(report, limit=5)
+    error = ""
+    try:
+        material_capabilities.write_report(
+            report, os.path.join(_precheck_directory(settings), CAPABILITY_REPORT_NAME))
+    except OSError as exc:
+        error = str(exc)
+        lines.append("Report not written: %s" % exc)
+    settings.last_capability = material_capabilities.summary_text(report)
+    settings.last_capability_lines = "\n".join(lines)
+    return report, error
+
+
+def _visual_note(census: Dict[str, Any]) -> str:
+    """Status suffix such as ' | visual: FAIL 1, PASS 2'; empty when nothing was compared."""
+    visual = census.get("visual") or {}
+    if not visual:
+        return ""
+    return " | visual: " + ", ".join("%s %d" % row for row in sorted(visual.items()))
+
+
+def _completion_status(census: Dict[str, Any]) -> str:
+    """Final status for a run without failures; approximated outputs are named.
+
+    A run that converted any object under the approximation opt-in is not
+    reported as "Clean": its outputs are not faithful conversions.  Parts
+    restored from durable checkpoints and the visual verdicts are named too.
+    """
+    approximated = int(census.get("approximated") or 0)
+    restored = int(census.get("checkpoint_restored") or 0)
+    if approximated:
+        status = ("Completed: %d object(s), %d APPROXIMATED under the explicit opt-in "
+                  "(not faithful; see manifest)" % (census.get("ok", 0), approximated))
+    else:
+        status = "Clean: %d object(s) completed" % census.get("ok", 0)
+    if restored:
+        status += " (%d restored from checkpoints)" % restored
+    return status + _visual_note(census)
+
+
+def _failure_status(census: Dict[str, Any]) -> str:
+    """Final status for a run whose census failed, with any visual verdicts."""
+    return "Finished with failures: %d failed, %d skipped%s" % (
+        census.get("failed", 0), census.get("skipped", 0), _visual_note(census))
+
+
+def _refresh_capability_summary(operator: Any, settings: Any, objects: Iterable[Any]) -> None:
+    """Advisory panel refresh before a Run: it may warn, never cancel the Run.
+
+    The engine applies the capability policy itself; a summary that cannot
+    be computed or written must not stop the bake.
+    """
+    try:
+        _capability_preflight(settings, objects)
+    except Exception as exc:
+        traceback.print_exc()
+        settings.last_capability = "Material capability summary unavailable: %s" % exc
+        settings.last_capability_lines = ""
+        operator.report({"WARNING"}, settings.last_capability)
+
+
 class IMPORTGLUE_PG_settings(PropertyGroup):
     scope: EnumProperty(
         name="Scope",
@@ -531,6 +617,15 @@ class IMPORTGLUE_PG_settings(PropertyGroup):
         name="Allow CPU Fallback",
         default=False,
         description="Continue on CPU when no Cycles GPU is available; this can take many hours",
+    )
+    allow_approximation: BoolProperty(
+        name="Allow Approximated Materials",
+        default=False,
+        description=(
+            "Convert materials whose effects the four maps cannot hold (transmission, coat, "
+            "view-dependent inputs, closure mixes...). Outputs are labelled APPROXIMATED "
+            "with every reason in the manifest; blocked materials are never converted"
+        ),
     )
     route_mode: EnumProperty(
         name="Route",
@@ -610,6 +705,16 @@ class IMPORTGLUE_PG_settings(PropertyGroup):
             % (engine.DONE_LIST_NAME, engine.POISON_STRIKES)
         ),
     )
+    durable_checkpoints: BoolProperty(
+        name="Durable Checkpoints",
+        default=True,
+        description=(
+            "Save every completed part (its output object and four maps) as a verified "
+            "checkpoint beside the done list, so a reopened original file or a crashed "
+            "run restores finished parts instead of baking them again. Costs one extra "
+            "copy of each part's maps on disk"
+        ),
+    )
     rerun_completed: BoolProperty(
         name="Rerun Completed Objects",
         default=False,
@@ -644,10 +749,41 @@ class IMPORTGLUE_PG_settings(PropertyGroup):
         name="Pack, Purge, and Save .blend", default=False,
         description="Pack all images, purge orphans, and overwrite the open blend after a clean run",
     )
+    visual_validation: BoolProperty(
+        name="Save Visual Comparison", default=False,
+        description=(
+            "Render each converted part beside its source and save reference, output and "
+            "difference images with a PASS / FAIL / INSUFFICIENT_COVERAGE / "
+            "UNSUPPORTED_REFERENCE report in the output folder. Adds Cycles renders per part"
+        ),
+    )
+    visual_validation_gate: BoolProperty(
+        name="Require Visual PASS (experimental)", default=False,
+        description=(
+            "EXPERIMENTAL: treat every non-PASS visual verdict as a failure and block the finalize "
+            "save. The render thresholds are calibrated on synthetic fixtures only; recalibrate them "
+            "on your asset class before relying on this gate"
+        ),
+    )
+    visual_resolution: IntProperty(name="Visual Resolution", default=128, min=32, max=1024)
+    visual_samples: IntProperty(name="Visual Samples", default=64, min=1, max=4096)
+    visual_probe: EnumProperty(
+        name="Visual Probe",
+        description=(
+            "Surface probe resolution. Auto sizes it from each part's layout (256 to 2048); a "
+            "too-small probe is reported as INSUFFICIENT_COVERAGE with the size it needs"
+        ),
+        items=[("AUTO", "Auto", "Smallest of 256-2048 the layout predicts is enough"),
+               ("256", "256", ""), ("512", "512", ""), ("1024", "1024", ""),
+               ("2048", "2048", "")],
+        default="AUTO",
+    )
     show_advanced: BoolProperty(name="Advanced", default=False)
     last_status: StringProperty(name="Last Status")
     last_output: StringProperty(name="Last Output")
     last_report: StringProperty(name="Last Report")
+    last_capability: StringProperty(name="Last Capability Summary")
+    last_capability_lines: StringProperty(name="Last Capability Findings")
 
 
 class IMPORTGLUE_OT_precheck(Operator):
@@ -688,8 +824,35 @@ class IMPORTGLUE_OT_precheck(Operator):
             _set_status(settings, "Precheck error: %s" % exc)
             self.report({"ERROR"}, "Texture precheck failed: %s" % exc)
             return {"CANCELLED"}
+        try:
+            capability, capability_error = _capability_preflight(settings, targets)
+        except Exception as exc:
+            traceback.print_exc()
+            capability, capability_error = None, str(exc)
+            settings.last_capability = "Material capability check failed: %s" % exc
+            settings.last_capability_lines = ""
         summary = "Precheck clean" if result["ok"] else "Precheck blocked (code %d)" % result["code"]
+        if settings.visual_validation:
+            # Report only: which used materials the visual check can reference.
+            # Advisory, like the capability summary: it may say it failed, but
+            # it never changes the texture precheck's verdict.
+            try:
+                from .visual_validation import surface_reference_support
+                support = surface_reference_support(targets)
+                unsupported = sorted(name for name, row in support.items()
+                                     if not row["supported"])
+                summary += " | visual reference: %d supported, %d unsupported%s" % (
+                    len(support) - len(unsupported), len(unsupported),
+                    " (%s)" % ", ".join(unsupported[:3]) if unsupported else "")
+            except Exception as exc:
+                traceback.print_exc()
+                summary += " | visual reference check failed: %s" % exc
         _set_status(settings, summary, report=result["report_path"])
+        if capability_error:
+            self.report({"WARNING"}, "Material capability report: %s" % capability_error)
+        if capability is not None and not capability["policy"]["allowed"]:
+            self.report({"WARNING"}, settings.last_capability
+                        + "; see " + CAPABILITY_REPORT_NAME)
         if not result["ok"]:
             self.report({"ERROR"}, summary + "; see precheck report")
             return {"CANCELLED"}
@@ -815,6 +978,9 @@ class IMPORTGLUE_OT_run(Operator):
                 self.report({"ERROR"}, settings.last_status + "; see precheck report")
                 return "CANCELLED"
 
+        # Refresh the panel's capability summary (advisory; the engine applies
+        # the policy).  It can only warn, never cancel the Run.
+        _refresh_capability_summary(self, settings, selected)
         _set_status(settings, "Baking %d source mesh(es)..." % len(selected))
         args: Dict[str, Any] = {"tag": "Blender add-on %s" % ADDON_VERSION}
         if not settings.resume_enabled:
@@ -832,8 +998,7 @@ class IMPORTGLUE_OT_run(Operator):
         if census.get("exit_code"):
             _set_status(
                 settings,
-                "Finished with failures: %d failed, %d skipped" %
-                (census.get("failed", 0), census.get("skipped", 0)),
+                _failure_status(census),
                 output=output,
                 report=manifest,
             )
@@ -841,7 +1006,7 @@ class IMPORTGLUE_OT_run(Operator):
             return "CANCELLED"
         _set_status(
             settings,
-            "Clean: %d object(s) completed" % census.get("ok", 0),
+            _completion_status(census),
             output=output,
             report=manifest,
         )
@@ -855,6 +1020,8 @@ class IMPORTGLUE_OT_run(Operator):
                 output=output,
                 report=manifest,
             )
+            self.report({"WARNING"}, settings.last_status)
+        elif census.get("approximated"):
             self.report({"WARNING"}, settings.last_status)
         else:
             self.report({"INFO"}, settings.last_status)
@@ -955,12 +1122,35 @@ class IMPORTGLUE_PT_main(Panel):
         row.enabled = settings.precheck_enabled and settings.repair_missing
         row.prop(settings, "repair_mode")
         safety.operator("import_glue.precheck", icon="VIEWZOOM")
+        if settings.last_capability:
+            capability = layout.box()
+            capability.label(text="Material Capability", icon="MATERIAL")
+            capability.label(text=settings.last_capability)
+            for line in settings.last_capability_lines.splitlines()[:5]:
+                row = capability.row()
+                row.alert = line.startswith("BLOCKED")
+                row.label(text=line)
 
         finalize = layout.box()
         finalize.alert = settings.finalize_in_session
         finalize.prop(settings, "finalize_in_session")
         if settings.finalize_in_session:
             finalize.label(text="Overwrites the open .blend after a clean run", icon="ERROR")
+
+        visual = layout.box()
+        visual.label(text="Visual Check", icon="IMAGE_REFERENCE")
+        visual.prop(settings, "visual_validation")
+        sub = visual.column()
+        sub.enabled = settings.visual_validation
+        sub.prop(settings, "visual_validation_gate")
+        sub.prop(settings, "visual_resolution")
+        sub.prop(settings, "visual_samples")
+        sub.prop(settings, "visual_probe")
+        if settings.visual_validation:
+            visual.label(text="Skipped or unsupported coverage is never a PASS", icon="INFO")
+            if settings.visual_validation_gate:
+                visual.label(text="Experimental gate: thresholds calibrated on synthetic fixtures only",
+                             icon="ERROR")
 
         layout.prop(settings, "show_advanced", emboss=False,
                     icon="DISCLOSURE_TRI_DOWN" if settings.show_advanced else "DISCLOSURE_TRI_RIGHT")
@@ -972,12 +1162,18 @@ class IMPORTGLUE_PT_main(Panel):
             advanced.prop(settings, "allow_corrupt")
             advanced.prop(settings, "strict_absolute")
             advanced.prop(settings, "resume_enabled")
+            checkpoint_row = advanced.row()
+            checkpoint_row.enabled = settings.resume_enabled
+            checkpoint_row.prop(settings, "durable_checkpoints")
             advanced.prop(settings, "rerun_completed")
             advanced.prop(settings, "auto_unwrap_no_uv")
             advanced.prop(settings, "crop_split_prepass")
             fallback = advanced.row()
             fallback.enabled = settings.device == "GPU"
             fallback.prop(settings, "allow_cpu_fallback")
+            approximation = advanced.row()
+            approximation.alert = settings.allow_approximation
+            approximation.prop(settings, "allow_approximation", icon="ERROR")
             advanced.prop(settings, "safe_batch_limit")
             advanced.prop(settings, "allow_oversized_batch")
             advanced.prop(settings, "enforce_triangle_budget")

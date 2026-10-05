@@ -1,4 +1,4 @@
-# Import Glue PBR Baker 1.3.0 / engine 3.7
+# Import Glue PBR Baker 1.4.0 / engine 3.8
 
 The add-on and background launcher convert selected game-rip meshes into duplicated
 Roblox-oriented meshes and four PBR PNG maps per part:
@@ -14,7 +14,7 @@ run log, resume list, and PNG files.
 
 ## Install
 
-1. Use `import_glue_pbr_baker-1.3.0-engine3.7.zip`; do not unzip it.
+1. Use `import_glue_pbr_baker-1.4.0-engine3.8.zip`; do not unzip it.
 2. In Blender, open **Edit > Preferences > Add-ons**.
 3. Choose **Install from Disk**, select the archive, then enable
    **Import Glue PBR Baker**.
@@ -91,6 +91,42 @@ Set Output Root to move the `<blend name>_exports` tree elsewhere.
 - The add-on never saves on an engine-level crash.
 - Blender's global backup-version preference is restored after finalization.
 
+## Milestone 1 additions (1.4.0 / engine 3.8)
+
+- **Material capability report and policy.** Check Textures writes
+  `material_capabilities.json` beside the precheck report and shows a summary;
+  every run embeds the same report in `manifest.json` (schema 3) and records a
+  `capability` decision per object. Each used material is SUPPORTED,
+  APPROXIMATION REQUIRED or BLOCKED, with the full node-instance path and a
+  next action. By default an object that needs an approximation is refused
+  (FAILED, route NONE, named reason). **Allow Approximated Materials**
+  (Advanced) / `--allow-approximation` converts it anyway, labelled
+  `APPROXIMATED` with every reason; such a run never ends `Clean`. BLOCKED
+  objects never convert. Existing dependency errors (`NODE_UNDEFINED`,
+  missing textures, Shader to RGB, Object Info Random) keep their messages and
+  precedence.
+- **Durable checkpoints** (on with resume). Each finished part is saved as an
+  immutable, hash-verified generation under `<blend>_exports/_rbx_ckpt/`
+  (maps, a self-contained output object/mesh/material payload, manifest written
+  last). When a part's output is not in the open file (a reopened original, a
+  crash), the run restores it from its checkpoint, re-runs the unchanged
+  `validate_done_entry()` gate, and reports
+  `Clean: N object(s) completed (K restored from checkpoints)`. A tampered,
+  incomplete, moved-away or incompatible checkpoint is refused with a reason
+  code and the part is rebaked. Done lists from 1.3.0 stay readable; they have
+  no checkpoint (`NO_CHECKPOINT`).
+- **Visual comparison report** (off by default). **Save Visual Comparison** /
+  `--visual-validation` saves reference, output, difference and mask images
+  plus a hashed `report.json` per part under `<run folder>/visual/`. Verdicts
+  are PASS, FAIL, INSUFFICIENT_COVERAGE and UNSUPPORTED_REFERENCE; a skipped or
+  unsupported comparison is never PASS. **Require Visual PASS (experimental)**
+  / `--visual-gate` makes non-PASS verdicts fail the census; its render
+  thresholds are calibrated on synthetic fixtures only.
+- Blender 5.x custom split normals (`INT16_2D`) and `FLOAT4` attributes are now
+  fingerprinted, so resume and checkpoints work on typical imported meshes.
+
+See `docs/USER_GUIDE.md` for codes, settings and limits.
+
 ## Copy finalization
 
 **Pack, Purge, and Save .blend** is off by default in the UI. When enabled, a
@@ -136,7 +172,10 @@ for an empty engine scope, 11 for missing material textures, and 12 for corrupt
 material textures.
 
 The package also accepts `--res`, `--max-res`, `--density`, `--device`,
-`--route`, and `--output-root`. Without `--res` / `--max-res`, headless mode
+`--route`, and `--output-root`. 1.4.0 adds `--allow-approximation`,
+`--visual-validation`, `--visual-gate` (requires `--visual-validation`) and
+`--visual-settings <file.json>`; each is off unless given, and a bad value
+stops the launcher with exit code 2 before any output is written. Without `--res` / `--max-res`, headless mode
 retains the engine's 4096 bake / 8192 crop defaults. Pass both explicitly for a
 bounded run, using the resolution validated for your asset and machine.
 

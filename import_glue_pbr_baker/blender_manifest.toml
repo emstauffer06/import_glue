@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "import_glue_pbr_baker"
-version = "1.3.0"
+version = "1.4.0"
 name = "Import Glue PBR Baker"
 tagline = "Bake game-rip materials into Roblox-ready PBR maps"
 maintainer = "Sohra"

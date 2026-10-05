@@ -1,6 +1,7 @@
 """Background-mode entry point for the packaged Import Glue engine."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Any, List, Optional
@@ -16,7 +17,8 @@ from . import engine, precheck
 KNOWN_FLAGS = frozenset({
     "collection", "only", "done", "no-resume", "rerun", "no-finalize", "repair",
     "tag", "mem-gate", "res", "max-res", "density", "device", "route",
-    "output-root",
+    "output-root", "allow-approximation",
+    "visual-validation", "visual-gate", "visual-settings",
 })
 
 
@@ -200,6 +202,56 @@ def _apply_runtime_flags(args: Any) -> None:
             fail("--mem-gate must be a number of GB")
         if not 0.0 < gate <= 1024.0:
             fail("--mem-gate must be between 0 and 1024 GB")
+    if "allow-approximation" in args:
+        if args.get("allow-approximation") is not True:
+            fail("--allow-approximation takes no value")
+        engine.ALLOW_APPROXIMATION = True
+    _apply_visual_flags(args, fail)
+
+
+def _apply_visual_flags(args: Any, fail: Any) -> None:
+    """M1-C: the visual comparison is an explicit option, never on by default.
+
+    --visual-validation saves a source-vs-output report per converted part;
+    --visual-gate (only together with it) makes every non-PASS verdict a census
+    failure that blocks finalize; --visual-settings <file.json> overrides
+    visual_validation.default_settings() keys.  The overrides are validated
+    here, before any output exists, with the same rule compare_pair() applies,
+    so a typo can never fall back to a different threshold.  Skipped or
+    unsupported coverage is never a PASS; that rule lives in the module.
+    """
+    for name in ("visual-validation", "visual-gate"):
+        if name in args and args.get(name) is not True:
+            fail("--%s takes no value" % name)
+    wanted = "visual-validation" in args
+    if not wanted:
+        for name in ("visual-gate", "visual-settings"):
+            if name in args:
+                fail("--%s requires --visual-validation" % name)
+        return
+    overrides = None
+    if "visual-settings" in args:
+        path = args.get("visual-settings")
+        if not isinstance(path, str) or not path.strip():
+            fail("--visual-settings requires a JSON file path")
+        try:
+            with open(path.strip(), "r", encoding="utf-8") as handle:
+                overrides = json.load(handle)
+        except (OSError, ValueError) as exc:
+            fail("--visual-settings could not be read as JSON: %s" % exc)
+        if not isinstance(overrides, dict):
+            fail("--visual-settings must hold a JSON object of settings")
+        from .visual_validation import default_settings, validate_settings
+        merged = default_settings()
+        merged["probe_resolution"] = "auto"
+        merged.update(overrides)
+        try:
+            validate_settings(merged)
+        except ValueError as exc:
+            fail("--visual-settings is invalid: %s" % exc)
+    engine.VISUAL_VALIDATION = True
+    engine.VISUAL_VALIDATION_GATE = "visual-gate" in args
+    engine.VISUAL_VALIDATION_SETTINGS = overrides
 
 
 def main() -> None:

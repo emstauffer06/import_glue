@@ -211,9 +211,15 @@ if not __package__:
         sys.modules[_support_name] = _support
     __package__ = _support_name
 
+from . import material_capabilities
 from .shader_graph import material_dependencies, used_materials
 from .uv_validation import validate_uv
 from .media_delivery import stage_external_media, restore_media_paths
+from . import checkpoints as durable_checkpoints
+
+# Script/Text-Editor runs execute this file as __main__: bind the checkpoint
+# module to THIS engine so it sees the same config globals and caches.
+durable_checkpoints.bind_engine(sys.modules[__name__])
 
 
 # ================================ CONFIG =====================================
@@ -248,6 +254,13 @@ RES = 4096
 # gap further up in this docstring before relying on it for a shared GPU.
 DEVICE = "GPU"                        # GPU | CPU
 ALLOW_CPU_FALLBACK = True              # headless compatibility; add-on defaults False
+# Backends ensure_cycles_device() tries for DEVICE="GPU", in this order.
+GPU_BACKENDS = ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI")
+# Milestone 1: a material whose effects the delivered maps cannot hold is
+# refused unless explicitly opted in; an opted-in output is labelled
+# APPROXIMATED with its reasons, never SUPPORTED.  BLOCKED never converts.
+ALLOW_APPROXIMATION = False
+CAPABILITY_PROFILE = "PBR_BASE"       # material_capabilities output profile
 PACK_MRA_GRAPH_BAKE = True             # equivalent metal/rough/opacity in one pass
 
 # Source discovery.  Keep this empty for portable use.  The saved .blend
@@ -561,7 +574,10 @@ _T0                = time.time()
 # V3.3/V3.3b and V3.4 flags are folded into this same block, each marked.
 # ==========================================================================
 TOOL_NAME             = "import_glue"
-TOOL_VERSION          = "3.7"  # v3.7: required graph/UV gates, packed scalar parity, CPU recovery,
+TOOL_VERSION          = "3.8"  # v3.8: material capability policy (no silent approximation),
+                              #       durable completed-part checkpoints, optional visual
+                              #       comparison reports, INT16_2D/FLOAT4 attribute fingerprints
+                              # v3.7: required graph/UV gates, packed scalar parity, CPU recovery,
                               #       portable media delivery and source path restoration
                               # v3.6: sampling contract, colour-space invariant, opacity contract,
                               #       closure-structure gate (see the v3.6 notes below)
@@ -602,6 +618,7 @@ MAGENTA_MIN_RB        = 0.80    # v3.3: mean R and B at/above this ...
 MAGENTA_MAX_G         = 0.20    # v3.3: ... with mean G at/below this reads as the (1,0,1) placeholder
 DONE_LIST             = True    # native per-item done-list + --only resume
 DONE_LIST_NAME        = "_v32_done.json"
+DURABLE_CHECKPOINTS   = True    # M1-B: verified per-part checkpoint generations beside the done-list
 POISON_STRIKES        = 3       # consecutive failures before an item is auto-skipped
 BENIGN_BLACK          = True    # emission-only/no-diffuse black bakes report BLACK_OK
 BLACK_MAX_LEVEL       = 1e-4    # image_stats()["max"] at/below this reads as black
@@ -619,7 +636,17 @@ QUIET_LOG_PATTERNS    = (
     "HIPEW initialization failed",
     "More than one shader node tex image used for a texture",
 )
-MANIFEST_SCHEMA       = 2
+# M1-C visual comparison (addon/visual_validation.py).  Off by default: it adds
+# Cycles renders per part.  It never changes generated maps or UVs, so it is NOT
+# part of config_fingerprint(); its settings are recorded in manifest_config().
+VISUAL_VALIDATION          = False   # save a source-vs-output visual report per OK part
+VISUAL_VALIDATION_GATE     = False   # True: any non-PASS verdict blocks finalize and fails the census
+VISUAL_VALIDATION_SETTINGS = None    # dict overriding visual_validation.default_settings()
+_VISUAL_RUN_ID: Optional[str] = None  # one report folder per run; set by main()
+# v3 (M1) adds material_capabilities + per-object capability; the checkpoint
+# (resume.checkpoints, restored_from_checkpoint) and visual_validation keys are
+# additive and optional.
+MANIFEST_SCHEMA       = 3
 DONE_LIST_SCHEMA      = 6             # v6 also fingerprints the generated Blender object
 DONE_ENTRY_SCHEMA     = 4             # validates resumable per-object metadata
 CGROUP_MEM_CURRENT    = "/sys/fs/cgroup/memory.current"
@@ -3137,7 +3164,7 @@ def encode_constant_for_output(array: np.ndarray, semantic: str) -> np.ndarray:
 
 def process_crop(job: Job, duplicate: Any, folder: str, cache: PixelCache) -> Dict[str, Any]:
     with stage("route.crop"):
-        dependency = require_material_dependencies(job.materials_by_slot.values())
+        dependency = require_material_dependencies(job_dependency_materials(job))
         result = _process_crop_inner(job, duplicate, folder, cache)
         result["uv_validation"] = require_output_uv(duplicate, "CROP")
         result["dependency_validation"] = dependency
@@ -4459,6 +4486,24 @@ def estimate_graph_bake_resolution(job: Job) -> int:
     return res
 
 
+def job_dependency_materials(job: Job) -> List[Any]:
+    """Materials a job's dependency gate must check: its planned slots plus every
+    material only the source's EVALUATED mesh uses.
+
+    M1 final review finding 1: plan_jobs reads base-mesh slots, so a material a
+    modifier puts on faces (Solidify material offset, Geometry Nodes Set
+    Material) never reached this gate.  The capability policy defers to this
+    gate for dependency codes, so it must see the same materials.
+    """
+    result: List[Any] = []
+    seen: Set[int] = set()
+    for material in list(job.materials_by_slot.values()) + used_materials([job.source]):
+        if material is not None and material.as_pointer() not in seen:
+            seen.add(material.as_pointer())
+            result.append(material)
+    return result
+
+
 def require_material_dependencies(materials: Iterable[Any]) -> Dict[str, Any]:
     """Fail closed for required unsupported nodes and object-copy context."""
     diagnostics: List[Dict[str, Any]] = []
@@ -4547,7 +4592,7 @@ def cycles_bake(bake_type: str, resolution: int) -> None:
 
 
 def run_bake_route(operation: Any, job: Job, duplicate: Any, folder: str) -> Dict[str, Any]:
-    dependency = require_material_dependencies(job.materials_by_slot.values())
+    dependency = require_material_dependencies(job_dependency_materials(job))
     device = bpy.context.scene.cycles.device
     start = len(_BAKE_EVENTS)
     try:
@@ -4569,7 +4614,7 @@ def run_bake_route(operation: Any, job: Job, duplicate: Any, folder: str) -> Dic
 def graph_bake_pass(
     job: Job, obj: Any, semantic: str, resolution: int,
 ) -> Tuple[Any, Dict[str, Any], int]:
-    require_material_dependencies(job.materials_by_slot.values())
+    require_material_dependencies(job_dependency_materials(job))
     require_output_uv(obj, "GRAPH_BAKE")
     target = new_bake_image(
         "__RBX_GRAPH_%s_%s" % (job.file_base, semantic), resolution, semantic
@@ -5061,6 +5106,51 @@ def assign_preview_material(obj: Any, folder: str, base: str, alpha: bool) -> No
     obj.data.materials.append(material)
 
 
+def run_visual_validation(source: Any, output: Any, folder: str, file_base: str) -> Dict[str, Any]:
+    """M1-C: compare one converted part with its source and save the report.
+
+    Returns a JSON-safe manifest summary.  An exception inside the comparison
+    is recorded as FAIL, never hidden; cancellation (KeyboardInterrupt)
+    propagates like any other cancelled bake.  Reports go to
+    <folder>/visual/<run id>/<file_base>/ so a rerun into the same output
+    folder never overwrites an earlier verdict.  ``file_base`` is sanitised
+    into one path component (an object name may hold '/', '\\' or '..').
+    The probe resolution defaults to "auto" (sized from each part's layout).
+    """
+    if source is None or output is None:
+        return {"status": "NOT_RUN", "report": None, "reasons": ["VISUAL_OBJECT_UNAVAILABLE"]}
+    from .visual_validation import compare_pair, default_settings
+    settings = default_settings()
+    settings["probe_resolution"] = "auto"
+    raw = safe_text(file_base, "part")
+    component = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")[:48] or "part"
+    if component != raw:
+        component += "_" + hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:8]
+    destination = os.path.join(folder, "visual", _VISUAL_RUN_ID or "run", component)
+    # The device follows the ENGINE's configuration, resolved exactly as for a
+    # bake (same GPU choice and CPU-fallback rule), never the device the .blend
+    # happened to be saved with: CROP_SPLIT and resumed parts are compared
+    # outside the bake loop, where the scene still holds the saved setting.
+    # The guard restores the scene and Cycles preferences afterwards; nothing
+    # here raises into the caller (a failed restore is a FAIL verdict too).
+    try:
+        with SceneSettingsGuard(snapshot_cycles_preferences=DEVICE == "GPU"):
+            try:
+                device = ensure_cycles_device()
+            except Exception as exc:
+                return {"status": "FAIL", "report": None,
+                        "reasons": ["VISUAL_DEVICE_UNAVAILABLE"], "error": safe_text(exc)}
+            settings["device"] = "CPU" if device == "CPU" else "GPU"
+            settings.update(VISUAL_VALIDATION_SETTINGS or {})
+            report = compare_pair(source, output, destination, settings)
+    except Exception as exc:
+        return {"status": "FAIL", "report": None, "reasons": ["VISUAL_COMPARISON_NOT_RUN"],
+                "error": safe_text(exc)}
+    return {"status": report["status"], "report": os.path.join(destination, "report.json"),
+            "reasons": sorted({row["code"] for row in report["reasons"]}),
+            "fidelity_scope": report["coverage"].get("fidelity_scope")}
+
+
 def ensure_cycles_device() -> str:
     scene = bpy.context.scene
     if DEVICE != "GPU":
@@ -5068,7 +5158,7 @@ def ensure_cycles_device() -> str:
         return "CPU"
     try:
         prefs = bpy.context.preferences.addons["cycles"].preferences
-        for kind in ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"):
+        for kind in GPU_BACKENDS:
             try:
                 prefs.compute_device_type = kind
                 prefs.get_devices()
@@ -5542,6 +5632,33 @@ def record_done(done: Dict[str, Any], path: str, name: str, entry: Dict[str, Any
     save_done_list(path, done)
 
 
+def checkpoint_done_entry(done: Dict[str, Any], path: str, name: str, output_obj: Any) -> None:
+    """M1-B: persist a just-recorded OK part as a durable checkpoint generation.
+
+    Never fails the part: an output that cannot be captured faithfully keeps its
+    OK entry (live-object resume still works) and says why it has no checkpoint,
+    visibly, as a resume warning.
+    """
+    entry = done["objects"].get(name)
+    if not DURABLE_CHECKPOINTS or not entry or entry.get("status") != "OK":
+        return
+    try:
+        store = durable_checkpoints.object_store_dir(
+            durable_checkpoints.checkpoint_store_root(entry["folder"]), name)
+        entry["checkpoint"] = durable_checkpoints.write_checkpoint(
+            store, output_obj, entry, source_name=name)
+        entry.pop("checkpoint_unavailable", None)
+    except Exception as exc:
+        entry.pop("checkpoint", None)
+        entry["checkpoint_unavailable"] = safe_text(exc)
+        message = "durable checkpoint unavailable for %s: %s" % (name, safe_text(exc))
+        if message not in _DONE_LIST_WARNINGS:
+            _DONE_LIST_WARNINGS.append(message)
+        print("MACHINE|WARN checkpoint_unavailable obj=%s err=%s" % (name, safe_text(exc)),
+              flush=True)
+    save_done_list(path, done)
+
+
 def _digest_token(hasher: Any, *values: Any) -> None:
     for value in values:
         data = safe_text(value, "").encode("utf-8", "surrogatepass")
@@ -5908,6 +6025,10 @@ def _hash_mesh_geometry(hasher: Any, mesh: Any, label: str) -> None:
         "INT32_2D": ("value", 2, np.int32),
         "QUATERNION": ("value", 4, np.float32),
         "FLOAT4X4": ("value", 16, np.float32),
+        # Blender 5.x stores custom split normals as INT16_2D "custom_normal";
+        # without these two, every such mesh lost its done entry (M1, REVIEW_B 2).
+        "INT16_2D": ("value", 2, np.int32),
+        "FLOAT4": ("vector", 4, np.float32),
     }
     attributes = sorted(
         list(getattr(mesh, "attributes", ())),
@@ -6230,9 +6351,34 @@ def resume_metadata(
     }
 
 
+def local_object(name: Optional[str]) -> Optional[Any]:
+    """The LOCAL object called ``name``: generated and restored outputs are always
+    local, and a linked object may share the name (M1 final review finding 8)."""
+    if not name:
+        return None
+    return bpy.data.objects.get((name, None))
+
+
+def capability_decision(
+    source: Any, capability_cache: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """M1-A: the live capability decision for one source under the current policy.
+
+    Read-only.  The decision is found by (name, library), never by bare name;
+    None means no decision exists for this object and callers must refuse.
+    """
+    return material_capabilities.decision_for(
+        material_capabilities.object_decisions(
+            material_capabilities.analyze_objects(
+                [source], CAPABILITY_PROFILE, cache=capability_cache),
+            ALLOW_APPROXIMATION),
+        source)
+
+
 def validate_done_entry(
     entry: Dict[str, Any], source: Optional[Any] = None,
     source_index: Optional[Dict[str, AtlasSet]] = None,
+    capability_cache: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     """Verify a resume entry still has both its Blender object and PNG sets."""
     if entry.get("resume_schema") != DONE_ENTRY_SCHEMA:
@@ -6247,6 +6393,16 @@ def validate_done_entry(
         require_material_dependencies(used_materials([source]))
     except Exception as exc:
         return False, safe_text(exc)
+    # An output converted under an approximation opt-in must not be carried
+    # into a run whose policy refuses it; analysis is read-only and live.
+    # The decision is found by (name, library) and a missing one fails closed.
+    try:
+        capability = capability_decision(source, capability_cache)
+    except Exception as exc:
+        return False, "could not analyze material capability: %s" % safe_text(exc)
+    if capability is None or not capability["allowed"]:
+        return False, "material capability %s under the current policy" % (
+            (capability or {}).get("outcome", "UNKNOWN"))
     expected_config = safe_text(entry.get("config_fingerprint"), "")
     try:
         current_config = config_fingerprint()
@@ -7248,10 +7404,11 @@ def failure_census(manifest_path: str,
         "magenta_suspect": 0, "no_material": 0, "over_triangle_budget": 0,
         "finalize_error": 0,
         "export_error": 0, "state_restore_error": 0,
-        "reconstructed": 0, "routes": {},
+        "reconstructed": 0, "checkpoint_restored": 0, "routes": {},
         "failed_items": [], "black_suspect_items": [], "missing_channel_items": [],
         "magenta_suspect_items": [], "no_material_items": [],
         "over_triangle_budget_items": [], "skipped_items": [],
+        "approximated": 0, "approximated_items": [],
     }
     report = fallback
     try:
@@ -7284,8 +7441,15 @@ def failure_census(manifest_path: str,
             census["skipped_items"].append("%s(%s)" % (name, str(item.get("reason", ""))[:60]))
         route = item.get("route", "NONE")
         census["routes"][route] = census["routes"].get(route, 0) + 1
+        decision = item.get("capability") if isinstance(item.get("capability"), dict) else {}
+        if status == "OK" and decision.get("outcome") == "APPROXIMATED":
+            census["approximated"] += 1
+            census["approximated_items"].append("%s(%s)" % (name, ",".join(
+                sorted({str(r.get("code")) for r in decision.get("reasons") or []}))[:60]))
         if item.get("reconstructed"):
             census["reconstructed"] += 1
+        if item.get("restored_from_checkpoint"):
+            census["checkpoint_restored"] += 1
         if item.get("black") == "BLACK_OK":
             census["black_ok"] += 1
         elif item.get("black") == "BLACK_SUSPECT":
@@ -7319,6 +7483,23 @@ def failure_census(manifest_path: str,
             census["over_triangle_budget_items"].append(
                 "%s(%d>%d)" % (name, triangles, triangle_budget)
             )
+    visual_counts: Dict[str, int] = {}
+    visual_not_pass: List[str] = []
+    visual_on = bool(config.get("visual_validation"))
+    for item in items:
+        if item.get("status") != "OK":
+            continue
+        if "visual_validation" not in item and not visual_on:
+            continue
+        # With the check on, an OK part without a verdict is NOT_RUN, never silent.
+        verdict = str((item.get("visual_validation") or {}).get("status") or "NOT_RUN")
+        visual_counts[verdict] = visual_counts.get(verdict, 0) + 1
+        if verdict != "PASS":
+            visual_not_pass.append("%s(%s)" % (item.get("object", "?"), verdict))
+    census["visual"] = visual_counts
+    census["visual_not_pass_items"] = visual_not_pass
+    visual_gate = bool(config.get("visual_validation") and config.get("visual_validation_gate"))
+    census["visual_gate"] = visual_gate
     resume = (report or {}).get("resume") if isinstance(report, dict) else None
     census["resume_warnings"] = (
         [safe_text(w) for w in (resume.get("warnings") or [])][:20]
@@ -7355,6 +7536,8 @@ def failure_census(manifest_path: str,
         hard += census["magenta_suspect"]
     if enforce_triangle_budget:
         hard += census["over_triangle_budget"]
+    if visual_gate:
+        hard += len(visual_not_pass)
     census["exit_code"] = 1 if hard else 0
     print("=" * 78)
     print("FAILURE CENSUS | %s" % manifest_path)
@@ -7378,6 +7561,10 @@ def failure_census(manifest_path: str,
     if census.get("state_restore_error_text"):
         print("  STATE RESTORE ERROR: %s" % census["state_restore_error_text"])
     print("  routes=%s" % census["routes"])
+    if visual_counts:
+        print("  visual=%s gate=%s" % (visual_counts, visual_gate))
+        for entry in visual_not_pass[:20]:
+            print("  %-15s %s" % ("VISUAL", entry))
     if census.get("run_error"):
         print("  RUN ERROR: %s" % census["run_error"])
     for label, key in (("FAILED", "failed_items"),
@@ -7391,9 +7578,15 @@ def failure_census(manifest_path: str,
             print("  %-15s %s" % (label, entry))
         if len(census[key]) > 20:
             print("  %-15s ... and %d more" % (label, len(census[key]) - 20))
-    print("  VERDICT: %s (exit_code=%d)"
-          % ("CLEAN" if not census["exit_code"] else "FAILURES PRESENT", census["exit_code"]))
+    for entry in census["approximated_items"][:20]:
+        print("  %-15s %s" % ("APPROXIMATED", entry))
+    verdict = "CLEAN" if not census["exit_code"] else "FAILURES PRESENT"
+    if not census["exit_code"] and census["approximated"]:
+        verdict = ("COMPLETED WITH %d APPROXIMATED OUTPUT(S) (explicit opt-in; not "
+                   "faithful conversions)" % census["approximated"])
+    print("  VERDICT: %s (exit_code=%d)" % (verdict, census["exit_code"]))
     print("=" * 78, flush=True)
+    print("MACHINE|capability approximated=%d" % census["approximated"], flush=True)
     print("MACHINE|census total=%d ok=%d failed=%d skipped=%d black_ok=%d black_suspect=%d missing_channel=%d "
           "magenta_suspect=%d no_material=%d over_triangle_budget=%d finalize_error=%d "
           "export_error=%d state_restore_error=%d exit=%d"
@@ -7412,11 +7605,16 @@ def manifest_config() -> Dict[str, Any]:
         "done_list_schema": DONE_LIST_SCHEMA,
         "pack_mra_graph": PACK_MRA_GRAPH_BAKE,
         "allow_cpu_fallback": ALLOW_CPU_FALLBACK,
+        "allow_approximation": ALLOW_APPROXIMATION,
+        "capability_profile": CAPABILITY_PROFILE,
+        "capability_rules_version": material_capabilities.RULES_VERSION,
         "force_visible_output": FORCE_VISIBLE_OUTPUT,
         "isolate_graph_bake": ISOLATE_GRAPH_BAKE,
         "force_view_layer": FORCE_VIEW_LAYER,
         "finalize_in_session": FINALIZE_IN_SESSION,
         "done_list": DONE_LIST,
+        "durable_checkpoints": DURABLE_CHECKPOINTS,
+        "checkpoint_schema": durable_checkpoints.CHECKPOINT_SCHEMA,
         "poison_strikes": POISON_STRIKES,
         "benign_black": BENIGN_BLACK,
         "crop_split_prepass": CROP_SPLIT_PREPASS,
@@ -7446,6 +7644,9 @@ def manifest_config() -> Dict[str, Any]:
         "source_normal_is_directx": SOURCE_NORMAL_IS_DIRECTX,
         "proxy_image_extension": PROXY_IMAGE_EXTENSION,
         "strip_vertex_colors": STRIP_VERTEX_COLORS,
+        "visual_validation": VISUAL_VALIDATION,
+        "visual_validation_gate": VISUAL_VALIDATION_GATE,
+        "visual_validation_settings": VISUAL_VALIDATION_SETTINGS,
     }
 
 
@@ -7485,6 +7686,10 @@ def pre_finalize_blockers(report: Dict[str, Any]) -> List[str]:
                 for material in materials.values()
             ):
                 blockers.append("NO_MATERIAL:%s" % name)
+        if VISUAL_VALIDATION and VISUAL_VALIDATION_GATE and status == "OK":
+            visual = item.get("visual_validation") or {}
+            if visual.get("status") != "PASS":
+                blockers.append("VISUAL_%s:%s" % (visual.get("status") or "NOT_RUN", name))
     return blockers
 
 
@@ -7507,6 +7712,8 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     an add-on can restore selection and visibility before the blend is saved.
     """
     reset_run_state()
+    global _VISUAL_RUN_ID
+    _VISUAL_RUN_ID = "%s_%d" % (time.strftime("%Y%m%d_%H%M%S"), os.getpid())
     args = dict(args_override) if args_override is not None else cli_args()
     run_tag = safe_text(args.get("tag"), "").strip() if args.get("tag") not in (None, True) else ""
     banner = provenance_banner("run start" + ((" | " + run_tag) if run_tag else ""))
@@ -7557,6 +7764,9 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     # Build once and reuse for both resume validation and planning.  Resume must
     # fingerprint the actual atlas files selected by the current resolver.
     source_index = build_source_index()
+    # One texture-validity cache for this run's capability analyses (resume
+    # validation, then the preflight); source files do not change in between.
+    capability_cache: Dict[str, Any] = {}
 
     # ---- resume: native done-list, one per scene (see done_list_path docstring)
     use_done = DONE_LIST and not args.get("no-resume")
@@ -7565,14 +7775,79 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         "version": DONE_LIST_SCHEMA, "objects": {}
     }
     carried: List[Dict[str, Any]] = []
+    # id(carried row) -> the source object resume validated for it.  Later
+    # steps use this object, never a bare-name lookup: a linked source can
+    # share its name with a local object (M1 final review finding 8).
+    carried_sources: Dict[int, Any] = {}
     poisoned: List[Dict[str, Any]] = []
+    checkpoint_events: List[Dict[str, Any]] = []
+    restored_collection = None
     if use_done and done["objects"]:
         keep: List[Any] = []
         for obj in selected:
             name = datablock_name(obj, "mesh_object")
             entry = done["objects"].get(name)
             if entry and entry.get("status") == "OK" and not args.get("rerun"):
-                resume_ok, resume_reason = validate_done_entry(entry, obj, source_index)
+                resume_ok, resume_reason = validate_done_entry(
+                    entry, obj, source_index, capability_cache=capability_cache)
+                restored = None
+                if not resume_ok and DURABLE_CHECKPOINTS and entry.get("checkpoint") is not None:
+                    if restored_collection is None:
+                        restored_collection = bpy.data.collections.new(
+                            OUTPUT_COLLECTION + "_RESTORED")
+                        bpy.context.scene.collection.children.link(restored_collection)
+                    # store_root: resolve the store-relative manifest path first,
+                    # so a moved output root still finds its generations.
+                    outcome = durable_checkpoints.restore_for_entry(
+                        entry, obj, source_index, collection=restored_collection,
+                        store_root=durable_checkpoints.checkpoint_store_root(folder),
+                        capability_cache=capability_cache)
+                    checkpoint_events.append({
+                        "object": name, "restored": bool(outcome.get("restored")),
+                        "code": outcome.get("code", ""), "reason": outcome.get("reason", ""),
+                        "checkpoint_id": outcome.get("checkpoint_id"),
+                        "output_object": outcome.get("object"),
+                        "manifest": outcome.get("manifest"),
+                        "blender": outcome.get("blender"),
+                    })
+                    if outcome.get("restored"):
+                        restored = outcome
+                        recorded_entry = entry
+                        entry = outcome["entry"]
+                        done["objects"][name] = entry
+                        # The existing gate, unweakened, on the restored part.
+                        resume_ok, resume_reason = validate_done_entry(
+                            entry, obj, source_index, capability_cache=capability_cache)
+                        print("RESUME: %s restored from checkpoint %s as %s"
+                              % (name, outcome["checkpoint_id"], outcome["object"]), flush=True)
+                    else:
+                        resume_reason = "%s; checkpoint not used: %s" % (
+                            resume_reason, outcome.get("reason"))
+                elif not resume_ok and DURABLE_CHECKPOINTS:
+                    # An entry from 1.3.0 (or one whose checkpoint could not be
+                    # written) stays readable; say explicitly why nothing is
+                    # restored instead of leaving only the live-object reason.
+                    unavailable = entry.get("checkpoint_unavailable")
+                    why = safe_text(unavailable) if unavailable else (
+                        "the done entry predates durable checkpoints or was written "
+                        "with them off")
+                    checkpoint_events.append({
+                        "object": name, "restored": False, "code": "NO_CHECKPOINT",
+                        "reason": why, "checkpoint_id": None, "output_object": None,
+                        "manifest": None, "blender": None,
+                    })
+                    resume_reason = "%s; no durable checkpoint: %s" % (resume_reason, why)
+                live_capability = None
+                if resume_ok:
+                    # A carried part is labelled with the live decision that
+                    # validate_done_entry() just accepted, never with the done
+                    # entry's recorded copy: rules or policy may have changed.
+                    try:
+                        live_capability = capability_decision(obj, capability_cache)
+                    except Exception as exc:
+                        resume_ok = False
+                        resume_reason = ("could not analyze material capability: %s"
+                                         % safe_text(exc))
                 transfer = {"linked": 0, "copied": 0}
                 if resume_ok:
                     used_bases_before = set(_USED_BASES)
@@ -7585,6 +7860,12 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         _USED_BASES.update(used_bases_before)
                         resume_ok = False
                         resume_reason = "could not materialize carried outputs: %s" % safe_text(exc)
+                if not resume_ok and restored is not None:
+                    # Withdraw the restored part and keep the recorded entry (and
+                    # its checkpoint reference) for the rebake's bookkeeping.
+                    durable_checkpoints.discard_restored(restored)
+                    entry = recorded_entry
+                    done["objects"][name] = entry
                 if resume_ok:
                     carried.append({
                         "object": name,
@@ -7609,7 +7890,12 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         "resume_materialized": transfer,
                         "uv_validation": entry.get("uv_validation"),
                         "dependency_validation": entry.get("dependency_validation"),
+                        "capability": live_capability,
+                        "capability_recorded": entry.get("capability"),
+                        "restored_from_checkpoint": entry.get("restored_from_checkpoint")
+                        if restored is not None else None,
                     })
+                    carried_sources[id(carried[-1])] = obj
                     continue
                 print("RESUME INVALID: %s -> rerun (%s)" % (name, resume_reason), flush=True)
             if entry and args.get("rerun") and int(entry.get("strikes", 0)):
@@ -7636,8 +7922,13 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                 continue
             keep.append(obj)
         selected = keep
-        print("RESUME: done-list %s -> already_ok=%d poison_skipped=%d remaining=%d"
-              % (done_path, len(carried), len(poisoned), len(selected)))
+        if restored_collection is not None and not restored_collection.objects:
+            bpy.data.collections.remove(restored_collection)
+        print("RESUME: done-list %s -> already_ok=%d (restored_from_checkpoint=%d, "
+              "checkpoint_not_used=%d) poison_skipped=%d remaining=%d"
+              % (done_path, len(carried), sum(1 for e in checkpoint_events if e["restored"]),
+                 sum(1 for e in checkpoint_events if not e["restored"]), len(poisoned),
+                 len(selected)))
 
     report: Dict[str, Any] = {
         "script": "import_glue.py v%s" % TOOL_VERSION,
@@ -7652,7 +7943,10 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         # long after this dict is built, and the manifest is serialized at run end.
         "resume": {"done_list": done_path, "enabled": bool(use_done),
                    "carried_over": len(carried), "poison_skipped": len(poisoned),
-                   "scoped_out": len(scoped_out), "warnings": _DONE_LIST_WARNINGS},
+                   "scoped_out": len(scoped_out), "warnings": _DONE_LIST_WARNINGS,
+                   "checkpoints": {"enabled": bool(use_done and DURABLE_CHECKPOINTS),
+                                   "schema": durable_checkpoints.CHECKPOINT_SCHEMA,
+                                   "restore_attempts": checkpoint_events}},
         "view_layer": {"collections_unexcluded": unexcluded},
         "objects": [],
         "exports": {},
@@ -7662,7 +7956,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     cache = PixelCache(PIXEL_CACHE_MAX_MB)
     outputs: List[Any] = [
         obj for item in carried
-        for obj in [bpy.data.objects.get(item.get("output_object") or "")]
+        for obj in [local_object(item.get("output_object"))]
         if obj is not None
     ]
     collection = output_collection()
@@ -7682,6 +7976,37 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                 "status": "SKIPPED", "route": "NONE", "reconstructed": False,
                 "reason": "empty mesh (0 polygons)",
             })
+        # Milestone 1 (A): read-only material capability preflight.  It never
+        # changes routes; the policy only decides whether an object may be
+        # converted at all.  Decisions are found by (name, library), never by
+        # bare name, and a missing one is refused.  Only gates that are on in
+        # this run keep their own failure: the dependency gate always, the
+        # empty/missing-slot gate only while CENSUS_FAIL_ON_NOMAT is set.
+        capability = material_capabilities.preflight_report(
+            selected, CAPABILITY_PROFILE, ALLOW_APPROXIMATION, cache=capability_cache
+        )
+        report["material_capabilities"] = capability
+        capability_index = material_capabilities.decision_index(
+            capability["object_decisions"])
+        refused_by_capability: Set[int] = set()
+        for obj in selected:
+            decision = capability_index.get(material_capabilities.object_identity(obj))
+            refusal = material_capabilities.policy_refusal(
+                decision, slot_gate=bool(CENSUS_FAIL_ON_NOMAT))
+            if refusal is None:
+                continue
+            refused_by_capability.add(obj.as_pointer())
+            name = datablock_name(obj, "mesh_object")
+            print("    CAPABILITY REFUSED %s: %s" % (name, refusal), flush=True)
+            # A deterministic policy refusal is not a crash: no done-list
+            # strike is recorded, so it cannot become a poison skip.
+            report["objects"].append({
+                "object": name, "status": "FAILED", "route": "NONE",
+                "reason": refusal, "capability": decision,
+                "reconstructed": False, "missing_channels": [],
+            })
+        if refused_by_capability:
+            selected = [o for o in selected if o.as_pointer() not in refused_by_capability]
         # Crop-split pre-pass: multi-material all-simple-slot objects take the
         # no-Cycles CROP path per slot; everything it declines falls through to
         # the stock router untouched, in this same session.
@@ -7698,6 +8023,10 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
             if joined is not None:
                 outputs.append(joined)
                 result["triangles"] = triangle_count(joined)
+                if VISUAL_VALIDATION:
+                    result["visual_validation"] = run_visual_validation(
+                        split_sources.get(result["object"]), joined, folder,
+                        file_base or result["object"])
             result["triangle_budget_exceeded"] = (
                 int(result.get("triangles", 0)) > TRI_BUDGET
             )
@@ -7714,6 +8043,10 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                                for ch in verify_part_outputs(folder, slot_base))
             result["missing_channels"] = missing
             result["reconstructed"] = False
+            split_source = split_sources.get(result["object"])
+            result["capability"] = capability_index.get(
+                material_capabilities.object_identity(split_source)
+            ) if split_source is not None else None
             if missing:
                 print("    MISSING CHANNELS: %s" % ",".join(missing))
             report["objects"].append(result)
@@ -7736,12 +8069,14 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                             "triangle_budget_exceeded", False
                         ),
                         "missing_channels": missing,
+                        "capability": result.get("capability"),
                         "folder": folder, "file_base": file_base,
                         "file_bases": file_bases,
                         **resume_metadata(
                             source, folder, file_bases, source_index, joined
                         ),
                     })
+                    checkpoint_done_entry(done, done_path, result["object"], joined)
                 except Exception as book_exc:
                     done["objects"].pop(result["object"], None)
                     save_done_list(done_path, done)
@@ -7810,7 +8145,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                     job.route, job.route_reason
                 ), flush=True)
                 try:
-                    require_material_dependencies(job.materials_by_slot.values())
+                    require_material_dependencies(job_dependency_materials(job))
                     ensure_reachable(job.source)
                     planned_paths = [
                         output_path(folder, job.file_base, ch) for ch in CHANNELS
@@ -7852,6 +8187,8 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         duplicate, folder, job.file_base, bool(detail.get("alpha"))
                     )
                     tris = triangle_count(duplicate)
+                    visual = (run_visual_validation(job.source, duplicate, folder, job.file_base)
+                              if VISUAL_VALIDATION else None)
                     outputs.append(duplicate)
                     item = {
                         "object": datablock_name(job.source, "mesh_object"),
@@ -7889,12 +8226,16 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                             for slot in job.used_slots
                         },
                         "warnings": job.warnings,
+                        "capability": capability_index.get(
+                            material_capabilities.object_identity(job.source)),
                         **detail,
                     }
                     # Per-part verification: every channel must be on disk, and a
                     # numerically black colour bake is graded, not shrugged at.
                     # Bookkeeping runs in its own guard: a defect in it must never
                     # reach the except branch below, which deletes this part's PNGs.
+                    if visual is not None:
+                        item["visual_validation"] = visual
                     item["missing_channels"] = []
                     item["reconstructed"] = False
                     try:
@@ -7933,6 +8274,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                                     "triangle_budget_exceeded", False
                                 ),
                                 "missing_channels": item["missing_channels"],
+                                "capability": item.get("capability"),
                                 "folder": folder, "file_base": job.file_base,
                                 "file_bases": [job.file_base],
                                 "prior_failure_reason": item.get("prior_failure_reason"),
@@ -7941,6 +8283,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                                     duplicate,
                                 ),
                             })
+                            checkpoint_done_entry(done, done_path, item["object"], duplicate)
                     except Exception as book_exc:
                         done["objects"].pop(item["object"], None)
                         save_done_list(done_path, done)
@@ -7988,6 +8331,19 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                             "prior_failure_reason": prior.get("reason"),
                         })
 
+        if VISUAL_VALIDATION:
+            for item in carried:
+                live = local_object(item.get("output_object"))
+                source = carried_sources.get(id(item))
+                item["visual_validation"] = (
+                    run_visual_validation(source, live, folder, item.get("file_base") or item["object"])
+                    if live is not None and source is not None else
+                    {"status": "NOT_RUN", "report": None, "reasons": ["VISUAL_OUTPUT_NOT_LIVE"]})
+            for item in report["objects"]:
+                if item.get("status") == "OK" and "visual_validation" not in item:
+                    item["visual_validation"] = {"status": "NOT_RUN", "report": None,
+                                                 "reasons": ["VISUAL_NOT_RUN_FOR_ROUTE"],
+                                                 "route": item.get("route")}
         export_outputs(outputs, folder, report)
     except Exception as run_exc:
         # A run that died before planning finished would otherwise write a

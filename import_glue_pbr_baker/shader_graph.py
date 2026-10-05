@@ -5,7 +5,9 @@ iterative, has no depth limit, and never changes the material or its images.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Optional
+
+import bpy
 
 
 # Named incompatibilities only: registered custom groups and other shader
@@ -19,20 +21,93 @@ def _pointer(value: Any) -> int:
     return int(value.as_pointer())
 
 
+def material_usage(obj: Any) -> dict:
+    """Material slots the faces of ``obj`` use, on the base AND the evaluated mesh.
+
+    A modifier can put faces on a slot no base-mesh face uses (Solidify's
+    material offset) or add a material of its own (Geometry Nodes Set
+    Material); Cycles renders and bakes the evaluated mesh.  Returns:
+
+    * ``base``: sorted slot indices the base mesh's polygons use, unclamped;
+    * ``evaluated``: {raw slot index: material or None} for the evaluated mesh
+      (empty unless ``state`` is EVALUATED).  Slot i resolves as Cycles
+      resolves it: the object's slot material, or the evaluated mesh's own
+      material for slots the evaluation added, with the index clamped to the
+      slot count as Blender clamps it;
+    * ``state``: BASE (no modifiers: the base mesh is what renders), EVALUATED,
+      NOT_EVALUATED (the object is not in the current view layer's depsgraph,
+      so only the base mesh can be read) or ERROR (evaluation raised);
+    * ``detail``: why, for NOT_EVALUATED and ERROR.
+
+    Read-only: the temporary evaluated mesh is always cleared.
+    """
+    base = sorted({int(polygon.material_index) for polygon in obj.data.polygons})
+    usage = {"base": base, "evaluated": {}, "state": "BASE", "detail": ""}
+    if not len(getattr(obj, "modifiers", ())):
+        return usage
+    evaluated_obj, mesh = None, None
+    try:
+        evaluated_obj = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        if not evaluated_obj.is_evaluated:
+            usage.update(state="NOT_EVALUATED",
+                         detail="not evaluated in the current view layer")
+            return usage
+        mesh = evaluated_obj.to_mesh()
+        slots = [slot.material for slot in obj.material_slots]
+        # The evaluated mesh holds evaluated (copy-on-evaluation) materials;
+        # callers compare, analyse and report the ORIGINAL datablocks.
+        own = [getattr(m, "original", m) if m is not None else None
+               for m in mesh.materials] if mesh is not None else []
+        count = max(len(slots), len(own))
+        raw = sorted({int(polygon.material_index) for polygon in mesh.polygons}) \
+            if mesh is not None else []
+        for index in raw:
+            if count == 0:
+                usage["evaluated"][index] = None
+                continue
+            clamped = min(max(index, 0), count - 1)
+            usage["evaluated"][index] = (slots[clamped] if clamped < len(slots)
+                                         else own[clamped])
+        usage["state"] = "EVALUATED"
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, never hidden
+        usage.update(state="ERROR", detail="%s: %s" % (type(exc).__name__, exc), evaluated={})
+    finally:
+        if mesh is not None:
+            try:
+                evaluated_obj.to_mesh_clear()
+            except Exception:
+                pass
+    return usage
+
+
+def usage_materials(obj: Any, usage: dict) -> list:
+    """Distinct materials of one ``material_usage`` result: base slots in slot
+    order, then the evaluated mesh's other materials in slot order."""
+    result, seen = [], set()
+    indices = set(usage["base"])
+    candidates = [slot.material for index, slot in enumerate(obj.material_slots)
+                  if index in indices]
+    candidates += [usage["evaluated"][index] for index in sorted(usage["evaluated"])]
+    for material in candidates:
+        if material is not None and _pointer(material) not in seen:
+            seen.add(_pointer(material))
+            result.append(material)
+    return result
+
+
 def used_materials(objects: Iterable[Any]) -> list:
-    """Distinct materials actually assigned to mesh polygons, in encounter order."""
+    """Distinct materials actually assigned to mesh polygons, in encounter order.
+
+    Base-mesh slots first, then every material only the EVALUATED mesh uses
+    (``material_usage``): dependency gates must see what Cycles will shade.
+    """
     result, seen = [], set()
     for obj in objects:
         if obj is None or obj.type != "MESH":
             continue
-        indices = {polygon.material_index for polygon in obj.data.polygons}
-        for index, slot in enumerate(obj.material_slots):
-            material = slot.material
-            if index not in indices or material is None:
-                continue
-            identity = _pointer(material)
-            if identity not in seen:
-                seen.add(identity)
+        for material in usage_materials(obj, material_usage(obj)):
+            if _pointer(material) not in seen:
+                seen.add(_pointer(material))
                 result.append(material)
     return result
 
@@ -81,6 +156,16 @@ def _static_scalar(socket: Any, context: tuple) -> Any:
     return None
 
 
+def static_scalar(socket: Any, context: Iterable[Any] = ()) -> Optional[float]:
+    """Read-only public form of the constant folding the walker itself uses."""
+    return _static_scalar(socket, tuple(context))
+
+
+def active_links(socket: Any) -> list:
+    """Links the walker follows: muted links never carry a dependency."""
+    return _links(socket)
+
+
 def _inputs(node: Any, output: Any, context: tuple) -> list:
     if node.mute:
         return [link.from_socket for link in node.internal_links
@@ -108,12 +193,20 @@ def _inputs(node: Any, output: Any, context: tuple) -> list:
     return inputs
 
 
-def material_dependencies(material: Any) -> dict:
+def material_dependencies(
+    material: Any, visit: Optional[Callable[[Any, Any, tuple], None]] = None,
+) -> dict:
     """Return images:set[int], diagnostics:list[dict], and node_count:int.
 
     Diagnostics contain severity (ERROR/WARNING/INFO), code, node, node_instance, and
     message. node_count counts distinct reachable node instances, including
     group boundary nodes. Consumers may reject ERROR diagnostics before baking.
+
+    ``visit(node, output_socket, context)`` is an optional read-only observer
+    called once for every required output socket of every non-muted node
+    instance the walk reaches (groups and group inputs included), where
+    ``context`` is the tuple of enclosing group nodes.  It sees exactly the
+    walker's notion of "required"; it must not modify the graph.
     """
     result = {"images": set(), "diagnostics": [], "node_count": 0}
     if material is None or not material.use_nodes or material.node_tree is None:
@@ -162,6 +255,8 @@ def material_dependencies(material: Any) -> dict:
         if node.mute:
             stack.extend((False, s, context) for s in _inputs(node, socket, context))
             continue
+        if visit is not None:
+            visit(node, socket, context)
         if node.type == "GROUP" or hasattr(node, "node_tree"):
             group = node.node_tree
             if group is None:
