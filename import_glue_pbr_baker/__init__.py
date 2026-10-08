@@ -17,13 +17,13 @@ from bpy.props import (
 from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup
 
-from . import engine, material_capabilities, precheck
+from . import engine, material_capabilities, precheck, background_ui
 
 
 bl_info = {
     "name": "Import Glue PBR Baker",
     "author": "Sohra",
-    "version": (1, 4, 0),
+    "version": (1, 6, 0),
     "blender": (4, 3, 0),
     "location": "3D Viewport > Sidebar > Roblox > Import Glue",
     "description": "Convert selected game-rip meshes into Roblox-ready PBR maps",
@@ -31,7 +31,7 @@ bl_info = {
 }
 
 
-ADDON_VERSION = "1.4.0"
+ADDON_VERSION = "1.6.0"
 ENGINE_CONFIG_KEYS = (
     "OUTPUT_ROOT",
     "RES",
@@ -41,6 +41,10 @@ ENGINE_CONFIG_KEYS = (
     # EngineConfig snapshots and restores it exactly like the other keys.
     "BAKE_DENSITY_SCALE",
     "DEVICE",
+    "GPU_DEVICE_ID",
+    "OUTPUT_PROFILE",
+    "TARGET_PROFILE",
+    "ROBLOX_TEXTURE_LIMIT",
     "ALLOW_CPU_FALLBACK",
     "ALLOW_APPROXIMATION",
     "SOURCE_DIRS",
@@ -410,6 +414,10 @@ class EngineConfig:
             "MAX_RES": int(settings.max_crop_resolution),
             "BAKE_DENSITY_SCALE": float(settings.bake_density_scale),
             "DEVICE": settings.device,
+            "GPU_DEVICE_ID": settings.gpu_device_id.strip(),
+            "OUTPUT_PROFILE": settings.output_profile,
+            "TARGET_PROFILE": settings.target_profile,
+            "ROBLOX_TEXTURE_LIMIT": int(settings.roblox_texture_limit),
             "ALLOW_CPU_FALLBACK": settings.allow_cpu_fallback,
             "ALLOW_APPROXIMATION": settings.allow_approximation,
             "SOURCE_DIRS": _split_directories(settings.source_directories),
@@ -453,7 +461,7 @@ def _source_objects(context: Any, settings: Any) -> List[Any]:
     seen = set()
     for obj in source:
         pointer = int(obj.as_pointer())
-        if pointer in seen or obj.type != "MESH" or not obj.data.polygons:
+        if pointer in seen or obj.type != "MESH" or (not obj.data.polygons and settings.target_profile == "LEGACY"):
             continue
         if engine.is_previous_output(obj):
             continue
@@ -502,8 +510,9 @@ def _capability_preflight(settings: Any, objects: Iterable[Any]) -> Tuple[Dict[s
     image paths; a report that cannot be written is said so, not hidden
     (write_report raises only OSError, encoding failures included).
     """
+    profile = "ROBLOX" if settings.target_profile in {"ROBLOX", "BOTH"} else engine.CAPABILITY_PROFILE
     report = material_capabilities.preflight_report(
-        list(objects), engine.CAPABILITY_PROFILE, bool(settings.allow_approximation))
+        list(objects), profile, bool(settings.allow_approximation))
     lines = material_capabilities.summary_lines(report, limit=5)
     error = ""
     try:
@@ -513,6 +522,9 @@ def _capability_preflight(settings: Any, objects: Iterable[Any]) -> Tuple[Dict[s
         error = str(exc)
         lines.append("Report not written: %s" % exc)
     settings.last_capability = material_capabilities.summary_text(report)
+    if settings.target_profile != "LEGACY":
+        settings.last_capability = "Portable PBR assessment: " + settings.last_capability
+        lines.append("Native closure/field eligibility is assessed separately during its run.")
     settings.last_capability_lines = "\n".join(lines)
     return report, error
 
@@ -532,6 +544,9 @@ def _completion_status(census: Dict[str, Any]) -> str:
     reported as "Clean": its outputs are not faithful conversions.  Parts
     restored from durable checkpoints and the visual verdicts are named too.
     """
+    if census.get("target_results"):
+        return "Delivered %d target(s), %d explicit approximation(s); see field report" % (
+            census.get("ok", 0), census.get("approximated", 0))
     approximated = int(census.get("approximated") or 0)
     restored = int(census.get("checkpoint_restored") or 0)
     if approximated:
@@ -546,6 +561,8 @@ def _completion_status(census: Dict[str, Any]) -> str:
 
 def _failure_status(census: Dict[str, Any]) -> str:
     """Final status for a run whose census failed, with any visual verdicts."""
+    if census.get("status") == "PARTIAL":
+        return "Partial delivery: completed target files retained; see delivery manifest"
     return "Finished with failures: %d failed, %d skipped%s" % (
         census.get("failed", 0), census.get("skipped", 0), _visual_note(census))
 
@@ -566,6 +583,42 @@ def _refresh_capability_summary(operator: Any, settings: Any, objects: Iterable[
 
 
 class IMPORTGLUE_PG_settings(PropertyGroup):
+    background_execution: BoolProperty(
+        name="Bake in Background", default=True,
+        description="Save a private snapshot and bake in a separate Blender process")
+    gpu_device_id: StringProperty(
+        name="GPU Name or Cycles ID",
+        description="Empty selects one GPU automatically; an explicit identity must match")
+    target_profile: EnumProperty(
+        name="Delivery Target",
+        items=(("BOTH", "Blender + Roblox", "Separate native material library and Roblox five-map package"),
+               ("BLENDER_NATIVE", "Blender Native", "Preserve closures and bake eligible static input fields"),
+               ("ROBLOX", "Roblox", "Five PNG maps, FBX, measured emission and SurfaceAppearance bindings"),
+               ("LEGACY", "Legacy Four Maps", "Existing four-map routes and durable checkpoints")),
+        default="BOTH",
+    )
+    roblox_texture_limit: EnumProperty(
+        name="Roblox Texture Preset",
+        items=(("512", "512", ""), ("1024", "1024", "Conservative delivery preset"),
+               ("2048", "2048", "Verify target import support in Studio"),
+               ("4096", "4096", "Verify target import support in Studio")),
+        default="1024",
+    )
+    output_profile: EnumProperty(
+        name="Output Precision",
+        items=(("PBR_BASE", "Standard PNG 8-bit", "Existing four-map contract"),
+               ("PBR_HIGH_PRECISION", "PNG 16-bit", "Float graph bake and true 16-bit output")),
+        default="PBR_BASE")
+    resource_enforce: BoolProperty(
+        name="Require Resource Headroom", default=False,
+        description="Reject unknown or insufficient free RAM/VRAM using a conservative planning estimate")
+    resource_reserve: FloatProperty(name="Free Memory Reserve", default=0.2, min=0, max=0.8,
+                                    subtype="FACTOR")
+    last_job_dir: StringProperty(name="Background Job", subtype="DIR_PATH")
+    last_job_state: StringProperty(name="Worker State")
+    uv_mip_level: IntProperty(name="UV Mip Level", default=0, min=0, max=12)
+    uv_margin_pixels: FloatProperty(name="UV Margin Pixels", default=2, min=0, max=64)
+    last_uv_report: StringProperty(name="UV Quality Report", subtype="FILE_PATH")
     scope: EnumProperty(
         name="Scope",
         items=(
@@ -583,13 +636,13 @@ class IMPORTGLUE_PG_settings(PropertyGroup):
     )
     bake_resolution: EnumProperty(
         name="Bake Resolution",
-        items=(("512", "512", ""), ("1024", "1024", "Roblox image limit"),
+        items=(("512", "512", ""), ("1024", "1024", "Conservative Roblox preset"),
                ("2048", "2048", ""), ("4096", "4096", ""), ("8192", "8192", "")),
         default="1024",
     )
     max_crop_resolution: EnumProperty(
         name="Crop Ceiling",
-        items=(("512", "512", ""), ("1024", "1024", "Roblox image limit"),
+        items=(("512", "512", ""), ("1024", "1024", "Conservative Roblox preset"),
                ("2048", "2048", ""), ("4096", "4096", ""), ("8192", "8192", "")),
         default="1024",
     )
@@ -1105,8 +1158,24 @@ class IMPORTGLUE_PT_main(Panel):
         output.prop(settings, "max_crop_resolution")
         output.prop(settings, "bake_density_scale")
         output.prop(settings, "device")
+        if settings.device == "GPU":
+            output.prop(settings, "gpu_device_id")
         output.prop(settings, "route_mode")
+        output.prop(settings, "target_profile")
+        if settings.target_profile in {"ROBLOX", "BOTH"}:
+            output.prop(settings, "roblox_texture_limit")
+        if settings.target_profile == "LEGACY":
+            output.prop(settings, "output_profile")
+        else:
+            output.label(text="New targets rerun from source; no legacy resume")
         output.prop(settings, "source_normal_is_directx")
+
+        quality = layout.box()
+        quality.label(text="UV Quality", icon="UV")
+        quality.prop(settings, "uv_mip_level")
+        quality.prop(settings, "uv_margin_pixels")
+        quality.operator("import_glue.uv_diagnose", icon="VIEWZOOM")
+        quality.operator("import_glue.uv_repair_copy", icon="DUPLICATE")
 
         safety = layout.box()
         safety.label(text="Texture Safety", icon="CHECKMARK")
@@ -1132,6 +1201,7 @@ class IMPORTGLUE_PT_main(Panel):
                 row.label(text=line)
 
         finalize = layout.box()
+        finalize.enabled = not settings.background_execution
         finalize.alert = settings.finalize_in_session
         finalize.prop(settings, "finalize_in_session")
         if settings.finalize_in_session:
@@ -1183,9 +1253,13 @@ class IMPORTGLUE_PT_main(Panel):
             advanced.prop(settings, "export_glb")
             advanced.prop(settings, "export_fbx")
 
+        background_ui.draw(layout, settings)
+
         run = layout.row()
         run.scale_y = 1.6
-        run.operator("import_glue.run", icon="RENDER_STILL")
+        run.enabled = settings.last_job_state not in {"RUNNING", "STARTING", "CANCEL_REQUESTED"}
+        run.operator("import_glue.background_start" if settings.background_execution
+                     else "import_glue.run", icon="RENDER_STILL")
 
         if settings.last_status:
             results = layout.box()
@@ -1203,7 +1277,7 @@ CLASSES = (
     IMPORTGLUE_OT_run,
     IMPORTGLUE_OT_open_output,
     IMPORTGLUE_PT_main,
-)
+) + background_ui.CLASSES
 
 
 # ---------------------------------------------------------------- migration
@@ -1308,6 +1382,7 @@ def register() -> None:
 
 
 def unregister() -> None:
+    background_ui.unregister_timer()
     engine.restore_log()
     if _migrate_on_load in bpy.app.handlers.load_post:
         try:

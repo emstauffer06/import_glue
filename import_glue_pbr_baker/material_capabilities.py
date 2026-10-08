@@ -40,7 +40,7 @@ from .precheck import _image_paths, file_looks_valid
 
 
 SCHEMA_VERSION = 1
-RULES_VERSION = 3   # 2: closure-path, topology and instancer rules; unknown Principled
+RULES_VERSION = 4   # 2: closure-path, topology and instancer rules; unknown Principled
                     #    inputs BLOCKED (REVIEW_A findings 1, 8, 9)
                     # 3: material usage read from the evaluated mesh, modifier-only
                     #    slots BLOCKED (FINAL_REVIEW finding 1); dielectric F0
@@ -77,6 +77,9 @@ PROFILES = {
         "dielectric_f0_tolerance": 1e-6,
     },
 }
+PROFILES["ROBLOX"] = {**PROFILES["PBR_BASE"],
+    "description": "Roblox SurfaceAppearance: RGB(A) ColorMap, OpenGL normal, grayscale metal/rough/emissive; emission factorization is validated after baking.",
+    "channels": PROFILES["PBR_BASE"]["channels"] + ["emissive_mask"]}
 
 # ---------------------------------------------------------------------------
 # Node rules.  Keys are bl_idname values.  A required node whose type is not
@@ -693,7 +696,11 @@ def _classify(node: Any, socket: Any, context: tuple, instance: str, first: bool
             users = image_users.setdefault(image.as_pointer(), [])
             if (instance, node.name) not in users:
                 users.append((instance, node.name))
-            if first and image.source in {"MOVIE", "SEQUENCE"}:
+            if first and image.source == "MOVIE":
+                issues.add("VIDEO_EXCLUDED", BLOCKED, "evaluability", node.name, instance,
+                           "Required video textures are excluded from static baking.",
+                           socket=socket.name, effect="time", image=image.name)
+            elif first and image.source == "SEQUENCE":
                 issues.add("TIME_DEPENDENT_IMAGE", APPROXIMATION_REQUIRED, "representability",
                            node.name, instance,
                            "Image '%s' is a %s; PBR_BASE maps are static, so the bake stores "
@@ -1057,6 +1064,15 @@ def analyze_material(material: Any, output_profile: str = DEFAULT_PROFILE,
                        "PBR_BASE maps store one frame." % animated_tree.name, effect="time")
 
     ordered = issues.sorted()
+    if output_profile == "ROBLOX":
+        # Only Principled emission has an implemented probe. All other closure
+        # and layer limitations retain their existing capability verdict.
+        for issue in ordered:
+            if issue.get("code") == "PBR_INPUT_UNREPRESENTED" and issue.get("effect") == "emission":
+                issue.update(code="EMISSION_FACTORIZATION_PENDING", impact=NONE,
+                             severity="INFO", category="information",
+                             action="Inspect the measured emission conversion in the output report; excessive residuals refuse by default.",
+                             message="Emission requires the measured Roblox mask/tint/strength factorization gate after the bake.")
     return {
         "schema_version": SCHEMA_VERSION,
         "rules_version": RULES_VERSION,

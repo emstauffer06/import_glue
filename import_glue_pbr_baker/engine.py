@@ -216,10 +216,37 @@ from .shader_graph import material_dependencies, used_materials
 from .uv_validation import validate_uv
 from .media_delivery import stage_external_media, restore_media_paths
 from . import checkpoints as durable_checkpoints
+from .run_control import RunCancelled
+from . import output_contract
 
 # Script/Text-Editor runs execute this file as __main__: bind the checkpoint
 # module to THIS engine so it sees the same config globals and caches.
 durable_checkpoints.bind_engine(sys.modules[__name__])
+
+# One engine run per Blender main thread. The previous controller is restored
+# by main(), including on error; ordinary synchronous callers pay only a None
+# check. Controllers must not call bpy from another thread.
+_RUN_CONTROL: Any = None
+_RUN_DONE_PATH = ""
+_NORMAL_ENCODING_ADJUSTMENTS: List[Dict[str, Any]] = []
+
+
+def _run_event(kind: str, **fields: Any) -> None:
+    if _RUN_CONTROL is not None:
+        _RUN_CONTROL.emit({"kind": kind, **fields})
+
+
+def _run_boundary(stage_name: str, **fields: Any) -> None:
+    _run_event("stage", stage=stage_name, **fields)
+    if _RUN_CONTROL is not None:
+        _RUN_CONTROL.check_cancel()
+
+
+def _mark_cancelled(report: Dict[str, Any], exc: BaseException) -> None:
+    report["cancelled"] = True
+    report["status"] = "CANCELLED"
+    report["cancel_reason"] = str(exc) or "Cancellation requested"
+    report["run_error"] = report["cancel_reason"]
 
 
 # ================================ CONFIG =====================================
@@ -256,11 +283,17 @@ DEVICE = "GPU"                        # GPU | CPU
 ALLOW_CPU_FALLBACK = True              # headless compatibility; add-on defaults False
 # Backends ensure_cycles_device() tries for DEVICE="GPU", in this order.
 GPU_BACKENDS = ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI")
+GPU_DEVICE_ID = ""                    # exact Cycles id or unique name; empty picks one GPU
+_LAST_DEVICE_SELECTION: Dict[str, Any] = {}
 # Milestone 1: a material whose effects the delivered maps cannot hold is
 # refused unless explicitly opted in; an opted-in output is labelled
 # APPROXIMATED with its reasons, never SUPPORTED.  BLOCKED never converts.
 ALLOW_APPROXIMATION = False
 CAPABILITY_PROFILE = "PBR_BASE"       # material_capabilities output profile
+OUTPUT_PROFILE = "PBR_BASE"           # PBR_BASE (8-bit) | PBR_HIGH_PRECISION (PNG16)
+TARGET_PROFILE = "LEGACY"            # LEGACY | BLENDER_NATIVE | ROBLOX | BOTH
+ROBLOX_TEXTURE_LIMIT = 1024           # Configurable delivery preset, not an engine maximum.
+_TARGET_PIPELINE_ACTIVE = False
 PACK_MRA_GRAPH_BAKE = True             # equivalent metal/rough/opacity in one pass
 
 # Source discovery.  Keep this empty for portable use.  The saved .blend
@@ -308,6 +341,7 @@ OUTPUT_SUFFIX = {
     "metal": "_MET",
     "rough": "_RGH",
     "normal": "_NOR",
+    "emissive": "_EMI",
 }
 
 # Missing maps become explicit neutral maps so every output set is complete.
@@ -574,7 +608,7 @@ _T0                = time.time()
 # V3.3/V3.3b and V3.4 flags are folded into this same block, each marked.
 # ==========================================================================
 TOOL_NAME             = "import_glue"
-TOOL_VERSION          = "3.8"  # v3.8: material capability policy (no silent approximation),
+TOOL_VERSION          = "4.0"  # v4.0: verified source capture and explicit native/Roblox targets.
                               #       durable completed-part checkpoints, optional visual
                               #       comparison reports, INT16_2D/FLOAT4 attribute fingerprints
                               # v3.7: required graph/UV gates, packed scalar parity, CPU recovery,
@@ -1070,6 +1104,7 @@ def reset_run_state() -> None:
         "_USED_BASES", "_DONE_LIST_WARNINGS", "_MAT_CACHE", "_DIM_CACHE",
         "_ATLAS_VALID_CACHE",
         "_SOURCE_FILE_DIGEST_CACHE", "_LIVE_IMAGE_DIGEST_CACHE", "_BAKE_EVENTS",
+        "_NORMAL_ENCODING_ADJUSTMENTS",
     ):
         cache = globals().get(cache_name)
         if hasattr(cache, "clear"):
@@ -2381,6 +2416,7 @@ def _plan_jobs_inner(selected: List[Any], disk_index: Dict[str, AtlasSet]) -> Tu
     skipped: List[Dict[str, Any]] = []
     for obj in selected:
         object_name = datablock_name(obj, "mesh_object")
+        _run_boundary("planning_object", object=object_name)
         try:
             if len(obj.data.polygons) == 0:
                 raise RuntimeError("empty mesh")
@@ -2470,7 +2506,11 @@ def _plan_jobs_inner(selected: List[Any], disk_index: Dict[str, AtlasSet]) -> Tu
                 and not stats.outside_01 and compact and not sampling_block
             proxy_safe = all_resolved and not sampling_block
             mode = ROUTE_MODE.upper()
-            if mode == "CROP_ONLY":
+            if high_precision_output():
+                if mode in {"CROP_ONLY", "PROXY_ONLY"}:
+                    raise RuntimeError("PBR_HIGH_PRECISION requires GRAPH_BAKE; incompatible forced route")
+                route, reason = "GRAPH_BAKE", "PBR_HIGH_PRECISION requires float graph bake buffers"
+            elif mode == "CROP_ONLY":
                 if not crop_safe:
                     raise RuntimeError(
                         "CROP_ONLY but crop prerequisites failed"
@@ -3164,8 +3204,10 @@ def encode_constant_for_output(array: np.ndarray, semantic: str) -> np.ndarray:
 
 def process_crop(job: Job, duplicate: Any, folder: str, cache: PixelCache) -> Dict[str, Any]:
     with stage("route.crop"):
+        require_output_profile_route("CROP")
         dependency = require_material_dependencies(job_dependency_materials(job))
         result = _process_crop_inner(job, duplicate, folder, cache)
+        result["output_contract"] = output_contract.build_output_contract(OUTPUT_PROFILE)
         result["uv_validation"] = require_output_uv(duplicate, "CROP")
         result["dependency_validation"] = dependency
         return result
@@ -3192,6 +3234,8 @@ def _process_crop_inner(job: Job, duplicate: Any, folder: str,
     # compress the wall-clock of roughly one. The bytes are unchanged.
     pending_writes: List[Tuple[str, np.ndarray]] = []
     for semantic in CHANNELS:
+        _run_boundary("pass", object=datablock_name(job.source), route=job.route,
+                      semantic=semantic)
         src = atlas.maps.get(semantic)
         path = output_path(folder, job.file_base, semantic)
         if src is None:
@@ -3303,6 +3347,7 @@ def _process_crop_inner(job: Job, duplicate: Any, folder: str,
                   % (semantic, job.file_base, over, clipped_fraction))
         result["maps"][semantic] = map_detail
 
+    _run_boundary("encode", object=datablock_name(job.source), route=job.route)
     write_png_batch(pending_writes)
     remap_crop_uv(duplicate.data, job.source_uv, crop_norm)
     result["alpha"] = alpha_used
@@ -3600,7 +3645,7 @@ def merge_alpha_from_channel(color: Any, packed: Any, channel: int) -> bool:
     c[:, 3] = a
     color.pixels.foreach_set(c.ravel())
     color.update()
-    return bool(np.any(a < 0.999))
+    return bool(np.any(a < output_alpha_cutoff()))
 
 
 def ensure_active_object(obj: Any) -> None:
@@ -3850,12 +3895,42 @@ def assign_proxy_slots(obj: Any, proxies: Dict[int, Any], fallback: Any) -> None
         mesh.materials[index] = proxies.get(index, fallback)
 
 
+def high_precision_output() -> bool:
+    return output_contract.build_output_contract(OUTPUT_PROFILE)["profile"] == "PBR_HIGH_PRECISION"
+
+
+def output_alpha_cutoff() -> float:
+    """Keep every opacity difference representable in the selected format."""
+    return 1.0 - 0.5 / 65535.0 if high_precision_output() else 0.999
+
+
+def require_output_profile_route(route: str) -> None:
+    contract = output_contract.build_output_contract(OUTPUT_PROFILE)
+    result = output_contract.assess_output_feasibility(contract, {
+        "route": route, "float_bake_buffer": high_precision_output(), "png16_writer": True,
+    })
+    if not result["ok"]:
+        raise RuntimeError("Output contract cannot be delivered by %s: %s" % (route, result))
+
+
+def write_output_pixels(path: str, pixels: np.ndarray) -> None:
+    """Pixels already have the declared transfer function; never encode twice."""
+    if high_precision_output():
+        output_contract.write_png16(path, pixels, compression=PNG_COMPRESS_LEVEL)
+    else:
+        write_png(path, pixels)
+
+
 def new_bake_image(name: str, resolution: int, semantic: str) -> Any:
+    high = high_precision_output() or semantic == "emission"
     image = bpy.data.images.new(
         name, width=resolution, height=resolution,
-        alpha=(semantic in {"color", "alpha"}), float_buffer=False,
+        alpha=(semantic in {"color", "alpha"}), float_buffer=high,
     )
-    image.colorspace_settings.name = "sRGB" if semantic == "color" else "Non-Color"
+    # Float targets retain raw scene-linear EMIT values. The output writer
+    # applies sRGB only to base-color RGB; data channels and alpha stay linear.
+    image.colorspace_settings.name = "sRGB" if semantic == "color" and not high else "Non-Color"
+    image["import_glue_semantic"] = semantic
     return image
 
 
@@ -3902,8 +3977,40 @@ def _save_blender_image_inner(image: Any, path: str) -> None:
     image.pixels.foreach_get(buf)
     h, w = image.size[1], image.size[0]
     rgba = buf.reshape(h, w, 4)
-    has_alpha = bool(np.any(rgba[..., 3] < 0.999))
-    write_png(path, rgba if has_alpha else rgba[..., :3])
+    if high_precision_output():
+        if not image.is_float:
+            raise RuntimeError("PBR_HIGH_PRECISION refuses an 8-bit bake buffer")
+        # Blender's native normal_compress() adds a 1e-5 bias to encoded
+        # normal RGB (render/intern/bake.cc), so a flat normal can be
+        # 1.00001001358. Only clamp native normal endpoints, within one
+        # UNORM16 code step; alpha, color and scalars retain strict bounds.
+        # Do not subtract the bias from all pixels: cleared background/margin
+        # values do not necessarily carry it. Record every such adjustment.
+        if image.get("import_glue_semantic") == "normal" and np.isfinite(rgba).all():
+            rgb = rgba[..., :3]
+            minimum, maximum = float(rgb.min()), float(rgb.max())
+            tolerance = 1.0 / 65535.0
+            if minimum >= -tolerance and maximum <= 1.0 + tolerance \
+                    and (minimum < 0.0 or maximum > 1.0):
+                adjustment = {
+                    "kind": "native_normal_endpoint_clamp", "map": os.path.basename(path),
+                    "minimum_before": minimum, "maximum_before": maximum,
+                    "clamped_components": int(np.count_nonzero((rgb < 0.0) | (rgb > 1.0))),
+                    "maximum_correction": max(0.0, -minimum, maximum - 1.0),
+                    "allowed_endpoint_excursion": tolerance,
+                }
+                np.clip(rgb, 0.0, 1.0, out=rgb)
+                _NORMAL_ENCODING_ADJUSTMENTS.append(adjustment)
+                _run_event(**adjustment)
+        if not np.isfinite(rgba).all() or np.any(rgba < 0) or np.any(rgba > 1):
+            raise RuntimeError("PNG16 requires finite normalized samples; it is not an HDR format "
+                               "(semantic=%s, min=%.12g, max=%.12g, finite=%s)" %
+                               (image.get("import_glue_semantic"), float(np.nanmin(rgba)),
+                                float(np.nanmax(rgba)), bool(np.isfinite(rgba).all())))
+        if image.get("import_glue_semantic") == "color":
+            rgba[..., :3] = linear_to_srgb(rgba[..., :3])
+    has_alpha = bool(np.any(rgba[..., 3] < output_alpha_cutoff()))
+    write_output_pixels(path, rgba if has_alpha else rgba[..., :3])
 
 
 def image_stats(image: Any) -> Dict[str, Any]:
@@ -3941,6 +4048,8 @@ def bake_pass(
     job: Job, obj: Any, semantic: str, resolution: int,
     source_uv: str, images: ProxyImageCache,
 ) -> Tuple[Any, Dict[str, Any], List[Any]]:
+    _run_boundary("pass", object=datablock_name(job.source), route=job.route,
+                  semantic=semantic, resolution=resolution)
     target = new_bake_image("__RBX_BAKE_%s_%s" % (job.file_base, semantic), resolution, semantic)
     proxies: Dict[int, Any] = {}
     created: List[Any] = []
@@ -3964,7 +4073,7 @@ def bake_pass(
         with stage("bake.cycles.proxy"):
             cycles_bake(bake_type, resolution)
         return target, image_stats(target), created
-    except Exception:
+    except BaseException:
         obj.data.materials.clear()
         if target.name in bpy.data.images:
             bpy.data.images.remove(target)
@@ -3980,6 +4089,8 @@ def bake_pass_mra(
 ) -> Tuple[Any, List[Any]]:
     """v3.4: one Cycles bake() call for metal+rough+alpha instead of up to three.
     See make_proxy_material_mra() for why this is safe for PROXY_BAKE specifically."""
+    _run_boundary("pass", object=datablock_name(job.source), route=job.route,
+                  semantic="mra", resolution=resolution)
     target = new_bake_image("__RBX_BAKE_%s_MRA" % job.file_base, resolution, "metal")
     proxies: Dict[int, Any] = {}
     created: List[Any] = []
@@ -4002,7 +4113,7 @@ def bake_pass_mra(
         with stage("bake.cycles.proxy_mra"):
             cycles_bake("EMIT", resolution)
         return target, created
-    except Exception:
+    except BaseException:
         obj.data.materials.clear()
         if target.name in bpy.data.images:
             bpy.data.images.remove(target)
@@ -4023,7 +4134,7 @@ def merge_alpha(color: Any, alpha: Any) -> bool:
     c[:, 3] = a
     color.pixels.foreach_set(c.ravel())
     color.update()
-    return bool(np.any(a < 0.999))
+    return bool(np.any(a < output_alpha_cutoff()))
 
 
 def material_requests_alpha(material: Any) -> bool:
@@ -4033,10 +4144,10 @@ def material_requests_alpha(material: Any) -> bool:
         return True
     tree = getattr(material, "node_tree", None)
     if not getattr(material, "use_nodes", False) or tree is None:
-        return float(material.diffuse_color[3]) < 0.999
+        return float(material.diffuse_color[3]) < output_alpha_cutoff()
     output = cycles_output_node(tree)
     if output is None or not output.inputs["Surface"].is_linked:
-        return float(material.diffuse_color[3]) < 0.999
+        return float(material.diffuse_color[3]) < output_alpha_cutoff()
     # Blender 5.2 exposes legacy blend_method=HASHED even for opaque shaders.
     # Opacity must come from the evaluated closure, not that compatibility flag.
     for inner_tree in iter_node_trees(tree):
@@ -4047,7 +4158,7 @@ def material_requests_alpha(material: Any) -> bool:
                     if alpha.is_linked:
                         return True
                     try:
-                        if float(alpha.default_value) < 0.999:
+                        if float(alpha.default_value) < output_alpha_cutoff():
                             return True
                     except Exception:
                         pass
@@ -4068,6 +4179,7 @@ def job_requests_alpha(job: Job) -> bool:
 
 def process_bake(job: Job, duplicate: Any, folder: str) -> Dict[str, Any]:
     with stage("route.proxy_bake"):
+        require_output_profile_route("PROXY_BAKE")
         return run_bake_route(_process_bake_inner, job, duplicate, folder)
 
 
@@ -4354,7 +4466,18 @@ def instrument_graph_semantic(root_tree: Any, semantic: str) -> int:
             emission.label = "__RBX_GRAPH_PROBE__"
             emission.location = (node.location.x + 180.0, node.location.y)
             emission.inputs["Strength"].default_value = 1.0
-            if semantic == "mra":
+            if semantic == "emission":
+                # Evaluate authored radiance before reducing it to Roblox's
+                # albedo-modulated grayscale mask. Preserve Color/Float casts.
+                color_name = "Emission Color" if node.type == "BSDF_PRINCIPLED" else "Color"
+                strength_name = "Emission Strength" if node.type == "BSDF_PRINCIPLED" else "Strength"
+                if node.type in {"BSDF_PRINCIPLED", "EMISSION"}:
+                    set_emission_color(tree, emission, node.inputs.get(color_name), 0.0)
+                    set_scalar_probe_input(tree, emission.inputs["Strength"],
+                                           node.inputs.get(strength_name), 1.0)
+                else:
+                    emission.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+            elif semantic == "mra":
                 # Float inputs preserve Blender's implicit color-to-scalar
                 # conversion. Mix/Add Shader then applies the same arithmetic
                 # independently to every RGB component of the emission.
@@ -4414,6 +4537,8 @@ def ensure_graph_surface(tree: Any, semantic: str, original: Optional[Any] = Non
             rgba = tuple(diffuse)[:4] if diffuse is not None else (0.8, 0.8, 0.8, 1.0)
             if len(rgba) == 3:
                 rgba = rgba + (1.0,)
+        elif semantic == "emission":
+            rgba = (0.0, 0.0, 0.0, 1.0)
         elif semantic == "alpha":
             a = float(diffuse[3]) if diffuse is not None and len(diffuse) >= 4 else 1.0
             rgba = (a, a, a, 1.0)
@@ -4561,6 +4686,8 @@ def cycles_bake(bake_type: str, resolution: int) -> None:
     scene = bpy.context.scene
     original_error = None
     for attempt in range(2):
+        _run_boundary("native_bake", bake_type=bake_type, resolution=resolution,
+                      attempt=attempt + 1, device=scene.cycles.device)
         event = {"type": bake_type, "resolution": resolution,
                  "device": scene.cycles.device, "status": "FAILED"}
         _BAKE_EVENTS.append(event)
@@ -4569,6 +4696,8 @@ def cycles_bake(bake_type: str, resolution: int) -> None:
             if "FINISHED" not in status:
                 raise RuntimeError("Cycles bake returned %r" % status)
             event["status"] = "OK"
+            _run_boundary("native_bake_complete", bake_type=bake_type,
+                          resolution=resolution, attempt=attempt + 1)
             return
         except Exception as exc:
             event["error"] = safe_text(exc)
@@ -4595,8 +4724,12 @@ def run_bake_route(operation: Any, job: Job, duplicate: Any, folder: str) -> Dic
     dependency = require_material_dependencies(job_dependency_materials(job))
     device = bpy.context.scene.cycles.device
     start = len(_BAKE_EVENTS)
+    normal_adjustment_start = len(_NORMAL_ENCODING_ADJUSTMENTS)
     try:
         result = operation(job, duplicate, folder)
+        result["output_contract"] = output_contract.build_output_contract(OUTPUT_PROFILE)
+        if len(_NORMAL_ENCODING_ADJUSTMENTS) > normal_adjustment_start:
+            result["normal_encoding_adjustments"] = _NORMAL_ENCODING_ADJUSTMENTS[normal_adjustment_start:]
         attempts = _BAKE_EVENTS[start:]
         result["dependency_validation"] = dependency
         result["uv_validation"] = require_output_uv(duplicate, job.route)
@@ -4612,8 +4745,10 @@ def run_bake_route(operation: Any, job: Job, duplicate: Any, folder: str) -> Dic
 
 
 def graph_bake_pass(
-    job: Job, obj: Any, semantic: str, resolution: int,
+    job: Job, obj: Any, semantic: str, resolution: int, face_slots=None,
 ) -> Tuple[Any, Dict[str, Any], int]:
+    _run_boundary("pass", object=datablock_name(job.source), route=job.route,
+                  semantic=semantic, resolution=resolution)
     require_material_dependencies(job_dependency_materials(job))
     require_output_uv(obj, "GRAPH_BAKE")
     target = new_bake_image(
@@ -4626,7 +4761,13 @@ def graph_bake_pass(
     # mesh.materials.clear() below resets every polygon material_index to 0, so
     # capture the source assignment first and re-apply it once the bake
     # materials are in place -- otherwise the whole mesh bakes with slot 0.
-    face_slots = source_face_slots(job, obj)
+    if face_slots is None:
+        face_slots = source_face_slots(job, obj)
+    if face_slots is None:
+        # Triangulation/decimation changed face count. The duplicate's face
+        # assignments are authoritative for the final bake topology.
+        face_slots = np.empty(len(obj.data.polygons), dtype=np.int32)
+        obj.data.polygons.foreach_get("material_index", face_slots)
     try:
         obj.data.materials.clear()
         for slot in range(slot_count):
@@ -4647,7 +4788,7 @@ def graph_bake_pass(
         with stage("bake.cycles.graph"):
             cycles_bake(bake_type, resolution)
         return target, image_stats(target), probe_count
-    except Exception:
+    except BaseException:
         if target.name in bpy.data.images:
             bpy.data.images.remove(target)
         raise
@@ -4965,6 +5106,7 @@ class GraphBakeIsolation:
 
 def process_graph_bake(job: Job, duplicate: Any, folder: str) -> Dict[str, Any]:
     with stage("route.graph_bake"):
+        require_output_profile_route("GRAPH_BAKE")
         return run_bake_route(_process_graph_bake_inner, job, duplicate, folder)
 
 
@@ -4980,6 +5122,17 @@ def _process_graph_bake_inner(job: Job, duplicate: Any, folder: str) -> Dict[str
             print("MACHINE|tri_budget object=%s before=%d after=%d budget=%d" % (job.file_base, b0, b1, TRI_BUDGET), flush=True)
     except Exception as exc:
         print("MACHINE|WARN tri_budget_failed object=%s err=%s" % (job.file_base, safe_text(exc)), flush=True)
+    if TARGET_PROFILE == "ROBLOX":
+        # Freeze the triangle topology before normal baking and FBX tangent
+        # export, rather than relying on the destination's quad diagonal.
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(duplicate.data)
+            bmesh.ops.triangulate(bm, faces=list(bm.faces))
+            bm.to_mesh(duplicate.data)
+            duplicate.data.update()
+        finally:
+            bm.free()
     uv_created = create_missing_source_uv(duplicate, job)
     uv_repair = repair_degenerate_source_uv(duplicate, job)
     if uv_created:
@@ -4994,6 +5147,9 @@ def _process_graph_bake_inner(job: Job, duplicate: Any, folder: str) -> Dict[str
     result["packed_scalars"] = PACK_MRA_GRAPH_BAKE
     if uv_repair:
         result.update(uv_repair)
+    # Preserve final-topology assignments outside the per-pass material cleanup.
+    graph_face_slots = np.empty(len(duplicate.data.polygons), dtype=np.int32)
+    duplicate.data.polygons.foreach_get("material_index", graph_face_slots)
     live_images: List[Any] = []
     alpha_used = False
     # ISOLATE_GRAPH_BAKE: ONE cull around ALL of this object's passes, not one
@@ -5004,7 +5160,7 @@ def _process_graph_bake_inner(job: Job, duplicate: Any, folder: str) -> Dict[str
     # so it stays outside.
     with GraphBakeIsolation(duplicate):
         try:
-            color, stats, probes = graph_bake_pass(job, duplicate, "color", resolution)
+            color, stats, probes = graph_bake_pass(job, duplicate, "color", resolution, graph_face_slots)
             live_images.append(color)
             if stats["max"] < 1e-4:
                 job.warnings.append("GRAPH_BAKE ColorMap is numerically all black")
@@ -5014,7 +5170,7 @@ def _process_graph_bake_inner(job: Job, duplicate: Any, folder: str) -> Dict[str
 
             if PACK_MRA_GRAPH_BAKE:
                 packed, _packed_stats, packed_probes = graph_bake_pass(
-                    job, duplicate, "mra", resolution)
+                    job, duplicate, "mra", resolution, graph_face_slots)
                 live_images.append(packed)
                 raw = np.empty(len(packed.pixels), dtype=np.float32)
                 packed.pixels.foreach_get(raw)
@@ -5024,15 +5180,15 @@ def _process_graph_bake_inner(job: Job, duplicate: Any, folder: str) -> Dict[str
                 result["alpha_stats"] = channel_stats(rgba, 2)
                 result["alpha_probes"] = packed_probes
                 for index, semantic in enumerate(("metal", "rough")):
-                    write_png(output_path(folder, job.file_base, semantic),
-                              rgba[:, index].reshape(resolution, resolution))
+                    write_output_pixels(output_path(folder, job.file_base, semantic),
+                                        rgba[:, index].reshape(resolution, resolution))
                     result["maps"][semantic] = {"size": [resolution, resolution],
                         "stats": channel_stats(rgba, index), "probes": packed_probes}
                 bpy.data.images.remove(packed)
                 live_images.remove(packed)
             elif job_requests_alpha(job):
                 alpha, alpha_stats, alpha_probes = graph_bake_pass(
-                    job, duplicate, "alpha", resolution)
+                    job, duplicate, "alpha", resolution, graph_face_slots)
                 live_images.append(alpha)
                 alpha_used = merge_alpha(color, alpha)
                 result["alpha_stats"] = alpha_stats
@@ -5043,13 +5199,33 @@ def _process_graph_bake_inner(job: Job, duplicate: Any, folder: str) -> Dict[str
             live_images.remove(color)
 
             for semantic in (("normal",) if PACK_MRA_GRAPH_BAKE else ("metal", "rough", "normal")):
-                image, pass_stats, pass_probes = graph_bake_pass(job, duplicate, semantic, resolution)
+                image, pass_stats, pass_probes = graph_bake_pass(job, duplicate, semantic, resolution, graph_face_slots)
                 live_images.append(image)
                 save_blender_image(image, output_path(folder, job.file_base, semantic))
                 result["maps"][semantic] = {"size": [resolution, resolution],
                     "stats": pass_stats, "probes": pass_probes}
                 bpy.data.images.remove(image)
                 live_images.remove(image)
+            if TARGET_PROFILE == "ROBLOX":
+                from .roblox_output import finalize_roblox_object
+                emission, emission_stats, emission_probes = graph_bake_pass(
+                    job, duplicate, "emission", resolution, graph_face_slots)
+                live_images.append(emission)
+                pixels = np.empty(len(emission.pixels), dtype=np.float32)
+                emission.pixels.foreach_get(pixels)
+                binding = finalize_roblox_object(
+                    folder,
+                    color_path=output_path(folder, job.file_base, "color"),
+                    metal_path=output_path(folder, job.file_base, "metal"),
+                    rough_path=output_path(folder, job.file_base, "rough"),
+                    normal_path=output_path(folder, job.file_base, "normal"),
+                    emission_pixels_linear=pixels.reshape(resolution, resolution, 4)[..., :3],
+                    dimensions=(resolution, resolution), binding_id=job.file_base,
+                    mesh_name=duplicate.name, allow_approximation=ALLOW_APPROXIMATION)
+                result["roblox_binding"] = binding
+                result["maps"]["emissive"] = {"size": [resolution, resolution],
+                    "stats": emission_stats, "probes": emission_probes,
+                    "factorization": binding["emission"]}
         finally:
             for image in live_images:
                 if image.name in bpy.data.images:
@@ -5071,7 +5247,8 @@ def load_preview_texture(tree: Any, path: str, semantic: str, y: float) -> Any:
     return node
 
 
-def assign_preview_material(obj: Any, folder: str, base: str, alpha: bool) -> None:
+def assign_preview_material(obj: Any, folder: str, base: str, alpha: bool,
+                            roblox_binding: Optional[Dict[str, Any]] = None) -> None:
     material = bpy.data.materials.new(base + "_RBX_PBR")
     material.use_nodes = True
     tree = material.node_tree
@@ -5102,6 +5279,19 @@ def assign_preview_material(obj: Any, folder: str, base: str, alpha: bool) -> No
                 material.blend_method = "HASHED"
             except Exception:
                 pass
+    if roblox_binding:
+        emission = roblox_binding["emission"]
+        mask = load_preview_texture(tree, output_path(folder, base, "emissive"), "emissive", -600)
+        tint = tree.nodes.new("ShaderNodeVectorMath")
+        tint.operation = "MULTIPLY"
+        tint.inputs[1].default_value = emission["tint_linear"]
+        tree.links.new(color.outputs["Color"], tint.inputs[0])
+        tree.links.new(tint.outputs["Vector"], principled.inputs["Emission Color"])
+        strength = tree.nodes.new("ShaderNodeMath")
+        strength.operation = "MULTIPLY"
+        strength.inputs[1].default_value = emission["strength"]
+        tree.links.new(mask.outputs["Color"], strength.inputs[0])
+        tree.links.new(strength.outputs[0], principled.inputs["Emission Strength"])
     obj.data.materials.clear()
     obj.data.materials.append(material)
 
@@ -5152,34 +5342,63 @@ def run_visual_validation(source: Any, output: Any, folder: str, file_base: str)
 
 
 def ensure_cycles_device() -> str:
+    """Choose exactly one GPU; an explicit identity never silently selects another."""
+    global _LAST_DEVICE_SELECTION
     scene = bpy.context.scene
+    _LAST_DEVICE_SELECTION = {"requested": DEVICE, "requested_id": GPU_DEVICE_ID,
+                              "backend": "CPU", "id": "", "name": "CPU"}
     if DEVICE != "GPU":
         scene.cycles.device = "CPU"
         return "CPU"
+    requested = str(GPU_DEVICE_ID or "").strip()
+    errors = []
     try:
         prefs = bpy.context.preferences.addons["cycles"].preferences
+    except Exception as exc:
+        prefs = None
+        errors.append(safe_text(exc))
+    if prefs is not None:
         for kind in GPU_BACKENDS:
+            _run_boundary("device_probe", backend=kind)
             try:
                 prefs.compute_device_type = kind
                 prefs.get_devices()
-                devices = [d for d in prefs.devices if d.type == kind]
-                if devices:
-                    for device in prefs.devices:
-                        device.use = device.type == kind
-                    scene.cycles.device = "GPU"
-                    print("Cycles device: %s (%s)" % (
-                        kind, ", ".join(d.name for d in devices)
-                    ))
-                    return kind
-            except Exception:
+                all_devices = list(prefs.devices)
+                devices = [(index, device) for index, device in enumerate(all_devices)
+                           if device.type == kind]
+            except Exception as exc:
+                errors.append("%s: %s" % (kind, safe_text(exc)))
                 continue
-    except Exception as exc:
-        print("GPU configuration failed:", exc)
+            if requested:
+                matches = [(index, device) for index, device in devices
+                           if requested == str(getattr(device, "id", ""))]
+                if not matches:
+                    matches = [(index, device) for index, device in devices
+                               if requested == device.name]
+                if len(matches) > 1:
+                    raise RuntimeError("GPU device name is ambiguous; select an exact Cycles id: %s"
+                                       % requested)
+            else:
+                matches = devices[:1]
+            if not matches:
+                continue
+            chosen_index, chosen = matches[0]
+            for index, device in enumerate(all_devices):
+                device.use = index == chosen_index
+            scene.cycles.device = "GPU"
+            _LAST_DEVICE_SELECTION.update(backend=kind, id=str(getattr(chosen, "id", "")),
+                                          name=str(chosen.name), enabled_device_count=1)
+            _run_event("device_selected", **_LAST_DEVICE_SELECTION)
+            print("Cycles device: %s (%s; id=%s)" % (kind, chosen.name,
+                  _LAST_DEVICE_SELECTION["id"]))
+            return kind
+    if requested:
+        raise RuntimeError("requested Cycles GPU device is unavailable: %s" % requested)
     if not ALLOW_CPU_FALLBACK:
-        raise RuntimeError(
-            "no supported Cycles GPU device was available and CPU fallback is disabled"
-        )
+        raise RuntimeError("no supported Cycles GPU device was available and CPU fallback is disabled")
     scene.cycles.device = "CPU"
+    _LAST_DEVICE_SELECTION.update(fallback=True, probe_errors=errors)
+    _run_event("device_selected", **_LAST_DEVICE_SELECTION)
     print("Cycles device: CPU fallback")
     return "CPU"
 
@@ -5212,7 +5431,7 @@ class SceneSettingsGuard:
                 prefs.get_devices()
                 self.values["cycles_prefs"] = {
                     "compute_device_type": prefs.compute_device_type,
-                    "uses": {(d.name, d.type): bool(d.use) for d in prefs.devices},
+                    "uses": {(str(getattr(d, "id", d.name)), d.type): bool(d.use) for d in prefs.devices},
                 }
             except Exception as exc:
                 raise RuntimeError(
@@ -5248,7 +5467,7 @@ class SceneSettingsGuard:
                 prefs.compute_device_type = saved["compute_device_type"]
                 prefs.get_devices()
                 for device in prefs.devices:
-                    key = (device.name, device.type)
+                    key = (str(getattr(device, "id", device.name)), device.type)
                     if key in saved["uses"]:
                         device.use = saved["uses"][key]
             except Exception as restore_exc:
@@ -5276,6 +5495,7 @@ def export_outputs(objects: List[Any], folder: str, report: Dict[str, Any]) -> N
             obj.select_set(True)
         bpy.context.view_layer.objects.active = objects[0]
         if EXPORT_GLTF:
+            _run_boundary("export", format="GLB")
             path = os.path.join(folder, "rbx_pbr_smart.glb")
             try:
                 operator_result = bpy.ops.export_scene.gltf(
@@ -5290,12 +5510,14 @@ def export_outputs(objects: List[Any], folder: str, report: Dict[str, Any]) -> N
                 report["exports"]["glb_error"] = str(exc)
                 print("GLB export failed:", exc)
         if EXPORT_FBX:
+            _run_boundary("export", format="FBX")
             path = os.path.join(folder, "rbx_pbr_smart.fbx")
             try:
                 operator_result = bpy.ops.export_scene.fbx(
                     filepath=path, use_selection=True, object_types={"MESH"},
                     path_mode="STRIP", embed_textures=False, bake_anim=False,
                     use_mesh_modifiers=True,
+                    use_tspace=(TARGET_PROFILE == "ROBLOX"),
                 )
                 if "FINISHED" not in operator_result or not os.path.isfile(path) or os.path.getsize(path) <= 0:
                     raise RuntimeError("FBX exporter did not produce a non-empty file (%s)" % operator_result)
@@ -5463,6 +5685,7 @@ def memory_gate(threshold_gb: Optional[float] = None,
         return {"gate": "skipped", "reason": "no cgroup memory.current readable"}
     waited = 0.0
     while current is not None and current >= threshold and waited < budget:
+        _run_boundary("memory_wait", waited_seconds=waited)
         print("MACHINE|memgate-wait%s mem=%.2fGB threshold=%.2fGB waited=%.0fs"
               % (("-" + tag) if tag else "", current, threshold, waited), flush=True)
         time.sleep(MEM_GATE_POLL_S)
@@ -6254,6 +6477,9 @@ def config_fingerprint() -> str:
             float(getattr(bpy.context.scene, "frame_subframe", 0.0)),
         ],
         "route_mode": ROUTE_MODE,
+        "output_profile": output_contract.build_output_contract(OUTPUT_PROFILE)["profile"],
+        "target_profile": TARGET_PROFILE,
+        "roblox_texture_limit": ROBLOX_TEXTURE_LIMIT,
         "resolution": {
             "min": MIN_RES, "bake": RES, "max": MAX_RES,
             "density_min": DENSITY_MIN_RES, "mode": RES_MODE,
@@ -6839,7 +7065,7 @@ def publish_staged_maps(folder: str, file_base: str, staging: str) -> List[str]:
     any map is missing or does not decode; the caller discards the attempt.
     """
     moves: List[Tuple[str, str]] = []
-    for semantic in CHANNELS:
+    for semantic in (CHANNELS + ("emissive",) if TARGET_PROFILE == "ROBLOX" else CHANNELS):
         source = output_path(staging, file_base, semantic)
         if not os.path.exists(source):
             raise PublishError("staged %s map was never written" % semantic)
@@ -6855,12 +7081,17 @@ def publish_staged_maps(folder: str, file_base: str, staging: str) -> List[str]:
                 % os.path.basename(destination)
             )
     published: List[str] = []
-    for source, destination in moves:
-        # Rename within one filesystem: atomic per file on POSIX and on Windows
-        # (MoveFileEx + MOVEFILE_REPLACE_EXISTING).  Atomic per file is not
-        # atomic per set -- the staging directory is what covers the set.
-        os.replace(source, destination)
-        published.append(destination)
+    try:
+        for source, destination in moves:
+            # Link without overwrite, on the same filesystem as the staging
+            # directory. A concurrent collision cannot replace someone else's
+            # file. The attempt owns only links it successfully created.
+            os.link(source, destination)
+            published.append(destination)
+            os.remove(source)
+    except BaseException as exc:
+        exc.published_paths = list(published)
+        raise
     return published
 
 
@@ -6878,7 +7109,7 @@ def finish_staging(staging: str) -> None:
                   % (staging, safe_text(exc)), flush=True)
 
 
-def discard_staged_part(folder: str, file_base: str) -> None:
+def discard_staged_part(folder: str, file_base: str, owned_paths=None) -> None:
     """Erase every trace of one part's publish attempt, finished or not.
 
     Destinations first, staging directory last: the directory is the marker that
@@ -6887,8 +7118,10 @@ def discard_staged_part(folder: str, file_base: str) -> None:
     closes its file, and preview textures are only ever loaded from published
     paths, after publication), so a failure is reported, not worked around.
     """
-    for semantic in CHANNELS:
-        destination = output_path(folder, file_base, semantic)
+    destinations = (list(owned_paths) if owned_paths is not None else
+                    [output_path(folder, file_base, semantic)
+                     for semantic in (CHANNELS + ("emissive",) if TARGET_PROFILE == "ROBLOX" else CHANNELS)])
+    for destination in destinations:
         try:
             if os.path.lexists(destination):
                 os.remove(destination)
@@ -7077,6 +7310,7 @@ def try_crop_split(obj: Any, source_index: Dict[str, AtlasSet], folder: str,
 
     try:
         for slot in used:
+            _run_boundary("crop_split_slot", object=datablock_name(obj), slot=slot)
             dup = duplicate_mesh_object(
                 obj, collection, "__SPLIT_%s_%d" % (file_base_root, slot)
             )
@@ -7168,13 +7402,17 @@ def try_crop_split(obj: Any, source_index: Dict[str, AtlasSet], folder: str,
 
 def crop_split_prepass(candidates: List[Any], source_index: Dict[str, AtlasSet],
                        folder: str, cache: PixelCache,
-                       collection: Any) -> Tuple[List[Dict[str, Any]], List[Any]]:
+                       collection: Any, on_committed_result: Any = None
+                       ) -> Tuple[List[Dict[str, Any]], List[Any]]:
     """Route multi-material all-simple-slot objects through CROP_SPLIT.
 
     Returns (results, handled_objects).  Objects the pre-pass declines are
     untouched and fall through to the stock router in the same session.
+    A callback publishes each completed object's resume/checkpoint bookkeeping
+    before the next object starts. It runs outside the route-failure handler:
+    a bookkeeping/cancellation exception must never reroute a committed object.
     """
-    if not CROP_SPLIT_PREPASS:
+    if not CROP_SPLIT_PREPASS or high_precision_output():
         return [], []
     multi = [o for o in candidates if len(used_material_slots(o.data)) >= 2]
     if not multi:
@@ -7183,6 +7421,8 @@ def crop_split_prepass(candidates: List[Any], source_index: Dict[str, AtlasSet],
     results: List[Dict[str, Any]] = []
     handled: List[Any] = []
     for obj in multi:
+        _run_boundary("crop_split_object", object=datablock_name(obj),
+                      completed=len(results), total=len(multi))
         try:
             result = try_crop_split(obj, source_index, folder, cache, collection)
         except CropSplitRollbackError:
@@ -7195,6 +7435,8 @@ def crop_split_prepass(candidates: List[Any], source_index: Dict[str, AtlasSet],
             continue
         handled.append(obj)
         results.append(result)
+        if on_committed_result is not None:
+            on_committed_result(result, obj)
         print("CROP_SPLIT OK obj=%s -> %s slots_split=%d"
               % (result["object"], result["output_object"], result["slots_split"]), flush=True)
     cache.clear()
@@ -7442,10 +7684,12 @@ def failure_census(manifest_path: str,
         route = item.get("route", "NONE")
         census["routes"][route] = census["routes"].get(route, 0) + 1
         decision = item.get("capability") if isinstance(item.get("capability"), dict) else {}
-        if status == "OK" and decision.get("outcome") == "APPROXIMATED":
+        emission_approximated = ((item.get("roblox_binding") or {}).get("emission") or {}).get("status") == "APPROXIMATED"
+        if status == "OK" and (decision.get("outcome") == "APPROXIMATED" or emission_approximated):
             census["approximated"] += 1
             census["approximated_items"].append("%s(%s)" % (name, ",".join(
-                sorted({str(r.get("code")) for r in decision.get("reasons") or []}))[:60]))
+                sorted({str(r.get("code")) for r in decision.get("reasons") or []}
+                       | ({"EMISSION_FACTORIZATION"} if emission_approximated else set())))[:60]))
         if item.get("reconstructed"):
             census["reconstructed"] += 1
         if item.get("restored_from_checkpoint"):
@@ -7538,7 +7782,13 @@ def failure_census(manifest_path: str,
         hard += census["over_triangle_budget"]
     if visual_gate:
         hard += len(visual_not_pass)
-    census["exit_code"] = 1 if hard else 0
+    census["cancelled"] = bool(isinstance(report, dict) and report.get("cancelled"))
+    census["exit_code"] = 130 if census["cancelled"] else (1 if hard else 0)
+    census["status"] = ("CANCELLED" if census["cancelled"] else
+                        "FAILED" if hard else "COMPLETED")
+    if census["cancelled"]:
+        census["cancel_reason"] = report.get("cancel_reason", "Cancellation requested")
+        census["done_list"] = (resume or {}).get("done_list", "")
     print("=" * 78)
     print("FAILURE CENSUS | %s" % manifest_path)
     print("  manifest_readable=%s total=%d" % (census["manifest_readable"], census["total"]))
@@ -7580,7 +7830,8 @@ def failure_census(manifest_path: str,
             print("  %-15s ... and %d more" % (label, len(census[key]) - 20))
     for entry in census["approximated_items"][:20]:
         print("  %-15s %s" % ("APPROXIMATED", entry))
-    verdict = "CLEAN" if not census["exit_code"] else "FAILURES PRESENT"
+    verdict = ("CANCELLED" if census["cancelled"] else
+               "CLEAN" if not census["exit_code"] else "FAILURES PRESENT")
     if not census["exit_code"] and census["approximated"]:
         verdict = ("COMPLETED WITH %d APPROXIMATED OUTPUT(S) (explicit opt-in; not "
                    "faithful conversions)" % census["approximated"])
@@ -7607,6 +7858,9 @@ def manifest_config() -> Dict[str, Any]:
         "allow_cpu_fallback": ALLOW_CPU_FALLBACK,
         "allow_approximation": ALLOW_APPROXIMATION,
         "capability_profile": CAPABILITY_PROFILE,
+        "target_profile": TARGET_PROFILE,
+        "roblox_texture_limit": ROBLOX_TEXTURE_LIMIT,
+        "output_profile": output_contract.build_output_contract(OUTPUT_PROFILE)["profile"],
         "capability_rules_version": material_capabilities.RULES_VERSION,
         "force_visible_output": FORCE_VISIBLE_OUTPUT,
         "isolate_graph_bake": ISOLATE_GRAPH_BAKE,
@@ -7628,6 +7882,7 @@ def manifest_config() -> Dict[str, Any]:
         "bake_res": RES,
         "max_res": MAX_RES,
         "device": DEVICE,
+        "gpu_device_id": GPU_DEVICE_ID,
         "export_glb": EXPORT_GLTF,
         "export_fbx": EXPORT_FBX,
         "triangle_budget": TRI_BUDGET,
@@ -7694,12 +7949,51 @@ def pre_finalize_blockers(report: Dict[str, Any]) -> List[str]:
 
 
 def main(args_override: Optional[Dict[str, Any]] = None,
-         before_finalize: Optional[Any] = None) -> Optional[Dict[str, Any]]:
-    """Run conversion while restoring precheck paths on every exit."""
+         before_finalize: Optional[Any] = None,
+         run_control: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    """Run conversion; optional cooperative control never interrupts native calls.
+
+    Cancellation returns exit_code=130/cancelled=True. Finished parts remain
+    resumable; an incomplete run never saves a final blend or earns CLEAN.
+    """
+    global _RUN_CONTROL, _RUN_DONE_PATH, _TARGET_PIPELINE_ACTIVE
+    previous, previous_done = _RUN_CONTROL, _RUN_DONE_PATH
+    _RUN_CONTROL, _RUN_DONE_PATH = run_control, ""
     try:
-        return _main_inner(args_override, before_finalize)
+        _run_boundary("prepare")
+        if TARGET_PROFILE != "LEGACY" and not _TARGET_PIPELINE_ACTIVE:
+            from . import pipeline
+            _TARGET_PIPELINE_ACTIVE = True
+            try:
+                result = pipeline.run(args_override, run_control=run_control,
+                                      before_finalize=before_finalize)
+            finally:
+                _TARGET_PIPELINE_ACTIVE = False
+        else:
+            result = _main_inner(args_override, before_finalize)
+        _run_event("run_finished", status=("CANCELLED" if result and result.get("cancelled")
+                   else "FAILED" if result and result.get("exit_code") else "COMPLETED" if result else "EMPTY"),
+                   census=result)
+        return result
+    except (RunCancelled, KeyboardInterrupt) as exc:
+        # Cancellation before _main_inner's report/finally exists (selection,
+        # source indexing or resume) must also be a distinct non-success.
+        result = {"exit_code": 130, "cancelled": True, "status": "CANCELLED",
+                  "cancel_reason": str(exc), "manifest": "", "total": 0,
+                  "ok": 0, "failed": 0, "skipped": 0, "done_list": _RUN_DONE_PATH}
+        if callable(before_finalize):
+            try:
+                before_finalize()
+            except Exception as restore_exc:
+                result["state_restore_error"] = safe_text(restore_exc)
+        _run_event("run_finished", status="CANCELLED", census=result)
+        return result
     finally:
-        restore_repointed_filepaths()
+        try:
+            restore_repointed_filepaths()
+            restore_log()
+        finally:
+            _RUN_CONTROL, _RUN_DONE_PATH = previous, previous_done
 
 
 def _main_inner(args_override: Optional[Dict[str, Any]] = None,
@@ -7717,6 +8011,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     args = dict(args_override) if args_override is not None else cli_args()
     run_tag = safe_text(args.get("tag"), "").strip() if args.get("tag") not in (None, True) else ""
     banner = provenance_banner("run start" + ((" | " + run_tag) if run_tag else ""))
+    _run_boundary("selection")
     if bpy.ops.object.mode_set.poll():
         bpy.ops.object.mode_set(mode="OBJECT")
     # Force-include BEFORE selection is read: objects in an excluded collection
@@ -7748,6 +8043,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
             print("Ignored %d previous output object(s)." % len(ignored))
         return None
 
+    _run_boundary("output_setup", total=len(selected))
     folder = output_directory()
     install_log(folder)
     # v1.1.1: a run folder can only hold a staging directory if an earlier
@@ -7760,10 +8056,13 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     recover_staged_parts(folder)
     provenance_banner("log start")
     start = time.time()
+    _run_event("run_directory", output=folder)
 
     # Build once and reuse for both resume validation and planning.  Resume must
     # fingerprint the actual atlas files selected by the current resolver.
+    _run_boundary("source_index")
     source_index = build_source_index()
+    _run_boundary("source_index_complete")
     # One texture-validity cache for this run's capability analyses (resume
     # validation, then the preflight); source files do not change in between.
     capability_cache: Dict[str, Any] = {}
@@ -7771,6 +8070,9 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     # ---- resume: native done-list, one per scene (see done_list_path docstring)
     use_done = DONE_LIST and not args.get("no-resume")
     done_path = done_list_path(folder, args.get("done"))
+    global _RUN_DONE_PATH
+    _RUN_DONE_PATH = done_path
+    _run_boundary("resume", done_list=done_path)
     done = load_done_list(done_path) if use_done else {
         "version": DONE_LIST_SCHEMA, "objects": {}
     }
@@ -7786,6 +8088,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         keep: List[Any] = []
         for obj in selected:
             name = datablock_name(obj, "mesh_object")
+            _run_boundary("resume_object", object=name)
             entry = done["objects"].get(name)
             if entry and entry.get("status") == "OK" and not args.get("rerun"):
                 resume_ok, resume_reason = validate_done_entry(
@@ -7892,10 +8195,13 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         "dependency_validation": entry.get("dependency_validation"),
                         "capability": live_capability,
                         "capability_recorded": entry.get("capability"),
+                        "normal_encoding_adjustments": entry.get("normal_encoding_adjustments", []),
                         "restored_from_checkpoint": entry.get("restored_from_checkpoint")
                         if restored is not None else None,
                     })
                     carried_sources[id(carried[-1])] = obj
+                    _run_event("object_resumed", object=name, completed=len(carried),
+                               checkpoint=entry.get("checkpoint"))
                     continue
                 print("RESUME INVALID: %s -> rerun (%s)" % (name, resume_reason), flush=True)
             if entry and args.get("rerun") and int(entry.get("strikes", 0)):
@@ -7938,6 +8244,14 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         "blend": bpy.data.filepath,
         "output": folder,
         "config": manifest_config(),
+        "output_contract": output_contract.build_output_contract(OUTPUT_PROFILE),
+        "target_profile": TARGET_PROFILE,
+        "target_output_contract": ({"profile": "ROBLOX_SURFACEAPPEARANCE",
+            "channels": ["color", "metal", "rough", "normal", "emissive"],
+            "texture_limit": ROBLOX_TEXTURE_LIMIT, "bits": 8,
+            "normal_convention": "OpenGL tangent space; triangulated before baking",
+            "emission": "quantized mask/tint/strength measured against final decoded color",
+            "studio_verified": False} if TARGET_PROFILE == "ROBLOX" else None),
         "args": {k: (v if isinstance(v, str) else bool(v)) for k, v in args.items()},
         # "warnings" is a live reference on purpose: save_done_list() appends to it
         # long after this dict is built, and the manifest is serialized at run end.
@@ -7963,6 +8277,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
     census: Dict[str, Any] = {}
 
     try:
+        _run_boundary("capability_preflight", total=len(selected))
         for obj in ignored:
             report["objects"].append({
                 "object": datablock_name(obj, "previous_output"),
@@ -7985,11 +8300,13 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         capability = material_capabilities.preflight_report(
             selected, CAPABILITY_PROFILE, ALLOW_APPROXIMATION, cache=capability_cache
         )
+        _run_boundary("capability_preflight_complete")
         report["material_capabilities"] = capability
         capability_index = material_capabilities.decision_index(
             capability["object_decisions"])
         refused_by_capability: Set[int] = set()
         for obj in selected:
+            _run_boundary("capability_object", object=datablock_name(obj))
             decision = capability_index.get(material_capabilities.object_identity(obj))
             refusal = material_capabilities.policy_refusal(
                 decision, slot_gate=bool(CENSUS_FAIL_ON_NOMAT))
@@ -8010,14 +8327,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         # Crop-split pre-pass: multi-material all-simple-slot objects take the
         # no-Cycles CROP path per slot; everything it declines falls through to
         # the stock router untouched, in this same session.
-        split_results, split_handled = crop_split_prepass(
-            selected, source_index, folder, cache, collection
-        )
-        split_sources = {datablock_name(o): o for o in split_handled}
-        if split_handled:
-            handled_names = set(split_sources)
-            selected = [o for o in selected if datablock_name(o) not in handled_names]
-        for result in split_results:
+        def commit_split_result(result: Dict[str, Any], split_source: Any) -> None:
             joined = result.pop("joined_object", None)
             file_base = result.pop("file_base", "")
             if joined is not None:
@@ -8025,7 +8335,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                 result["triangles"] = triangle_count(joined)
                 if VISUAL_VALIDATION:
                     result["visual_validation"] = run_visual_validation(
-                        split_sources.get(result["object"]), joined, folder,
+                        split_source, joined, folder,
                         file_base or result["object"])
             result["triangle_budget_exceeded"] = (
                 int(result.get("triangles", 0)) > TRI_BUDGET
@@ -8043,7 +8353,6 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                                for ch in verify_part_outputs(folder, slot_base))
             result["missing_channels"] = missing
             result["reconstructed"] = False
-            split_source = split_sources.get(result["object"])
             result["capability"] = capability_index.get(
                 material_capabilities.object_identity(split_source)
             ) if split_source is not None else None
@@ -8052,7 +8361,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
             report["objects"].append(result)
             if use_done:
                 try:
-                    source = split_sources.get(result["object"])
+                    source = split_source
                     if source is None:
                         raise RuntimeError("CROP_SPLIT source is unavailable for resume metadata")
                     file_bases = result.get("file_bases", [])
@@ -8087,6 +8396,21 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                     )
                     traceback.print_exc()
 
+            entry = done["objects"].get(result["object"], {})
+            _run_event("object_committed", object=result["object"], route="CROP_SPLIT",
+                       checkpoint=entry.get("checkpoint"),
+                       completed=sum(i.get("status") == "OK" for i in report["objects"]))
+
+        _run_boundary("crop_split")
+        split_results, split_handled = crop_split_prepass(
+            selected, source_index, folder, cache, collection,
+            on_committed_result=commit_split_result,
+        )
+        if split_handled:
+            handled_names = {datablock_name(o) for o in split_handled}
+            selected = [o for o in selected if datablock_name(o) not in handled_names]
+        _run_boundary("planning", total=len(selected))
+
         jobs, skipped = plan_jobs(selected, source_index)
         for entry in skipped:
             entry.setdefault("route", "NONE")
@@ -8111,6 +8435,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         # Proactive gate: OOM/SIGKILL was the dominant failure mode of the
         # campaign and the only defence anywhere was reactive retry.
         if needs_cycles:
+            _run_boundary("memory_admission")
             report["memory_gate"] = memory_gate(
                 float(args["mem-gate"]) if isinstance(args.get("mem-gate"), str) else None,
                 tag="bake",
@@ -8123,7 +8448,9 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
             bpy.context.scene.cycles.samples = 1
             bpy.context.scene.render.use_persistent_data = PERSISTENT_DATA
             if needs_cycles:
+                _run_boundary("device_setup")
                 ensure_cycles_device()
+                report["device_selection"] = dict(_LAST_DEVICE_SELECTION)
             # v3.4: prefs.get_devices() (called inside ensure_cycles_device) re-probes
             # every GPU/compute backend on EVERY run regardless of whether anything will
             # actually touch Cycles -- measured 0.25s wasted on a run that resolved to
@@ -8138,6 +8465,8 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                 j.route, datablock_name(j.source, "mesh_object"),
             ))
             for index, job in enumerate(jobs, 1):
+                _run_boundary("object", object=datablock_name(job.source),
+                              route=job.route, completed=index - 1, total=len(jobs))
                 duplicate = None
                 produced: List[str] = []
                 print("[%d/%d] %s -> %s (%s)" % (
@@ -8148,7 +8477,8 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                     require_material_dependencies(job_dependency_materials(job))
                     ensure_reachable(job.source)
                     planned_paths = [
-                        output_path(folder, job.file_base, ch) for ch in CHANNELS
+                        output_path(folder, job.file_base, ch)
+                        for ch in (CHANNELS + ("emissive",) if TARGET_PROFILE == "ROBLOX" else CHANNELS)
                     ]
                     collisions = [path for path in planned_paths if os.path.lexists(path)]
                     if collisions:
@@ -8174,21 +8504,29 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         else:
                             detail = process_graph_bake(job, duplicate, staging)
                         detail["uv_validation"] = require_output_uv(duplicate, job.route)
+                        _run_boundary("publish", object=datablock_name(job.source),
+                                      route=job.route)
                         produced = publish_staged_maps(folder, job.file_base, staging)
-                    except BaseException:
+                    except BaseException as publish_exc:
                         # BaseException, not Exception: a cancelled run raises
                         # KeyboardInterrupt, which the handler below does not
                         # catch -- that is exactly how partial sets survived.
-                        discard_staged_part(folder, job.file_base)
+                        discard_staged_part(folder, job.file_base,
+                                            owned_paths=getattr(publish_exc, "published_paths", []))
                         raise
                     finish_staging(staging)
                     strip_colors(duplicate.data)
                     assign_preview_material(
-                        duplicate, folder, job.file_base, bool(detail.get("alpha"))
+                        duplicate, folder, job.file_base, bool(detail.get("alpha")),
+                        detail.get("roblox_binding")
                     )
                     tris = triangle_count(duplicate)
+                    _run_boundary("validate", object=datablock_name(job.source),
+                                  route=job.route)
                     visual = (run_visual_validation(job.source, duplicate, folder, job.file_base)
                               if VISUAL_VALIDATION else None)
+                    _run_boundary("commit", object=datablock_name(job.source),
+                                  route=job.route)
                     outputs.append(duplicate)
                     item = {
                         "object": datablock_name(job.source, "mesh_object"),
@@ -8275,6 +8613,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                                 ),
                                 "missing_channels": item["missing_channels"],
                                 "capability": item.get("capability"),
+                                "normal_encoding_adjustments": item.get("normal_encoding_adjustments", []),
                                 "folder": folder, "file_base": job.file_base,
                                 "file_bases": [job.file_base],
                                 "prior_failure_reason": item.get("prior_failure_reason"),
@@ -8292,6 +8631,26 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         traceback.print_exc()
                     report["objects"].append(item)
                     print("    OK %d tris | %s" % (tris, job.file_base), flush=True)
+                except (RunCancelled, KeyboardInterrupt):
+                    # The current object has not reached its durable commit.
+                    # Remove only this attempt's output; do not record a FAILED
+                    # done entry or count cancellation as a material strike.
+                    if duplicate is not None:
+                        try:
+                            bpy.data.objects.remove(duplicate, do_unlink=True)
+                        except Exception:
+                            pass
+                    for path in produced:
+                        try:
+                            if os.path.exists(path):
+                                os.remove(path)
+                        except Exception:
+                            pass
+                    report["objects"].append({
+                        "object": datablock_name(job.source), "status": "CANCELLED",
+                        "route": job.route, "reason": "cancelled before object commit",
+                    })
+                    raise
                 except Exception as exc:
                     print("    FAIL:", exc)
                     traceback.print_exc()
@@ -8314,6 +8673,7 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                         "route": job.route,
                         "reason": safe_text(exc),
                         "bake_attempts": getattr(exc, "bake_attempts", []),
+                        "emission_conversion": getattr(exc, "result", None),
                         "prior_failure_reason": prior.get("reason"),
                         "reconstructed": False,
                         "missing_channels": [],
@@ -8331,8 +8691,19 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                             "prior_failure_reason": prior.get("reason"),
                         })
 
+                # Outside the failure/cleanup region: a newly requested cancel
+                # must preserve this completed object's files and checkpoint.
+                if report["objects"][-1].get("status") == "OK":
+                    entry = done["objects"].get(datablock_name(job.source), {})
+                    _run_event("object_committed", object=datablock_name(job.source),
+                               route=job.route, completed=index, total=len(jobs),
+                               checkpoint=entry.get("checkpoint"))
+                _run_boundary("object_complete", object=datablock_name(job.source),
+                              completed=index, total=len(jobs))
+
         if VISUAL_VALIDATION:
             for item in carried:
+                _run_boundary("visual_validation", object=item.get("object"))
                 live = local_object(item.get("output_object"))
                 source = carried_sources.get(id(item))
                 item["visual_validation"] = (
@@ -8344,7 +8715,11 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
                     item["visual_validation"] = {"status": "NOT_RUN", "report": None,
                                                  "reasons": ["VISUAL_NOT_RUN_FOR_ROUTE"],
                                                  "route": item.get("route")}
+        _run_boundary("exports")
         export_outputs(outputs, folder, report)
+        _run_boundary("exports_complete")
+    except (RunCancelled, KeyboardInterrupt) as cancel_exc:
+        _mark_cancelled(report, cancel_exc)
     except Exception as run_exc:
         # A run that died before planning finished would otherwise write a
         # manifest holding only the parts it managed, and the census would grade
@@ -8375,13 +8750,24 @@ def _main_inner(args_override: Optional[Dict[str, Any]] = None,
         if callable(before_finalize):
             try:
                 before_finalize()
+            except (RunCancelled, KeyboardInterrupt) as cancel_exc:
+                _mark_cancelled(report, cancel_exc)
             except Exception as exc:
                 state_restore_error = safe_text(exc)
                 report["state_restore_error"] = state_restore_error
                 print("STATE RESTORE before finalize FAILED: %s" % state_restore_error)
                 traceback.print_exc()
+        # Last cooperative boundary before an indivisible final save. A request
+        # arriving during that save is too late to undo a completed artifact.
+        if not report.get("cancelled"):
+            try:
+                _run_boundary("finalize")
+            except (RunCancelled, KeyboardInterrupt) as cancel_exc:
+                _mark_cancelled(report, cancel_exc)
         finalize_blockers = pre_finalize_blockers(report)
-        if finalize_blockers:
+        if report.get("cancelled"):
+            report["finalize"] = {"ran": False, "reason": "cancelled; completed checkpoints retained"}
+        elif finalize_blockers:
             report["pre_finalize_blockers"] = finalize_blockers
             report["finalize"] = {
                 "ran": False,

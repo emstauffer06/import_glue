@@ -8,7 +8,7 @@ from typing import Any, List, Optional
 
 import bpy
 
-from . import engine, precheck
+from . import engine, precheck, resources
 
 
 # Every flag this launcher and engine.main() actually consume.  cli_args()
@@ -19,6 +19,8 @@ KNOWN_FLAGS = frozenset({
     "tag", "mem-gate", "res", "max-res", "density", "device", "route",
     "output-root", "allow-approximation",
     "visual-validation", "visual-gate", "visual-settings",
+    "gpu-device", "output-profile", "resource-enforce", "resource-reserve",
+    "target", "roblox-texture-limit",
 })
 
 
@@ -87,7 +89,7 @@ def select_sources() -> List[Any]:
     bpy.ops.object.select_all(action="DESELECT")
     selected = []
     for obj in pool:
-        if obj.type != "MESH" or not obj.data.polygons or engine.is_previous_output(obj):
+        if obj.type != "MESH" or (not obj.data.polygons and engine.TARGET_PROFILE == "LEGACY") or engine.is_previous_output(obj):
             continue
         try:
             # Linked object IDs can make this global flag read-only.  Failure
@@ -187,6 +189,35 @@ def _apply_runtime_flags(args: Any) -> None:
         if route not in {"AUTO", "CROP_ONLY", "PROXY_ONLY", "GRAPH_ONLY", "BAKE_ONLY"}:
             fail("--route is not a supported route mode")
         engine.ROUTE_MODE = route
+    if "gpu-device" in args:
+        value = args["gpu-device"]
+        if not isinstance(value, str) or not value.strip() or len(value) > 512:
+            fail("--gpu-device requires an exact GPU name or Cycles device ID")
+        engine.GPU_DEVICE_ID = value.strip()
+    if "output-profile" in args:
+        value = args["output-profile"]
+        if value not in {"PBR_BASE", "PBR_HIGH_PRECISION"}:
+            fail("--output-profile must be PBR_BASE or PBR_HIGH_PRECISION")
+        engine.OUTPUT_PROFILE = value
+    if "target" in args:
+        value = args["target"]
+        if value not in {"LEGACY", "BLENDER_NATIVE", "ROBLOX", "BOTH"}:
+            fail("--target must be LEGACY, BLENDER_NATIVE, ROBLOX or BOTH")
+        engine.TARGET_PROFILE = value
+    if "roblox-texture-limit" in args:
+        limit = integer_flag("roblox-texture-limit")
+        if limit > 4096:
+            fail("--roblox-texture-limit must not exceed 4096")
+        engine.ROBLOX_TEXTURE_LIMIT = limit
+    if "resource-enforce" in args and args["resource-enforce"] is not True:
+        fail("--resource-enforce takes no value")
+    if "resource-reserve" in args:
+        try:
+            if not isinstance(args["resource-reserve"], str):
+                raise ValueError()
+            resources.validate_policy({"reserve_fraction": float(args["resource-reserve"])})
+        except (ValueError, TypeError):
+            fail("--resource-reserve requires a finite fraction in [0,0.8]")
     if "output-root" in args:
         if not isinstance(args.get("output-root"), str) or not args["output-root"].strip():
             fail("--output-root requires a path")
@@ -277,6 +308,16 @@ def main() -> None:
     precheck_objects = selected if only_scope is None else [
         obj for obj in selected if engine.datablock_name(obj) in only_scope
     ]
+    resource_policy = {"enforce": bool(args.get("resource-enforce")),
+                       "reserve_fraction": float(args.get("resource-reserve", 0.2)),
+                       "device_id": args.get("gpu-device", "")}
+    resource_check = resources.evaluate_policy(
+        resource_policy, {"RES": engine.RES, "MAX_RES": engine.MAX_RES, "DEVICE": engine.DEVICE,
+                          "GPU_DEVICE_ID": engine.GPU_DEVICE_ID},
+        resources.source_statistics(precheck_objects, bpy.data.images, bpy.data.filepath))
+    print("MACHINE|resource_admission|" + json.dumps(resource_check, sort_keys=True), flush=True)
+    if not resource_check["allowed"]:
+        raise _setup_error("Resource admission refused: " + resource_check["reason"])
     if engine.DONE_LIST and not args.get("no-resume"):
         done_override = args.get("done")
         if done_override and done_override is not True:

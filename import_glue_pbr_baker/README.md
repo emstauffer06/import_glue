@@ -1,4 +1,9 @@
-# Import Glue PBR Baker 1.4.0 / engine 3.8
+# Import Glue PBR Baker 1.5.0 / engine 3.9 candidate
+
+This candidate adds background Blender jobs, cancellation, verified checkpoint
+resume and explicit result append. The sidebar also includes UV diagnostics,
+repair copies, measured resource admission, one-GPU selection and true PNG16
+graph baking. See the candidate additions below for limits.
 
 The add-on and background launcher convert selected game-rip meshes into duplicated
 Roblox-oriented meshes and four PBR PNG maps per part:
@@ -14,15 +19,15 @@ run log, resume list, and PNG files.
 
 ## Install
 
-1. Use `import_glue_pbr_baker-1.4.0-engine3.8.zip`; do not unzip it.
+1. Use `import_glue_pbr_baker-1.5.0-engine3.9.zip`; do not unzip it.
 2. In Blender, open **Edit > Preferences > Add-ons**.
 3. Choose **Install from Disk**, select the archive, then enable
    **Import Glue PBR Baker**.
 4. In the 3D Viewport press **N**, open the **Roblox** tab, and use
    **Import Glue**.
 
-The manifest minimum is Blender 4.3; this release was verified on Windows 5.2.0
-and Linux 5.2.2. Restart an already open Blender after replacing the add-on so
+The manifest minimum is Blender 4.3. This candidate is tested in headless Linux
+Blender 5.2.2; Windows Blender GUI validation is pending. Restart Blender after replacing the add-on so
 its imported Python modules reload.
 
 To rebuild the deterministic archive from the source repository root, run:
@@ -209,8 +214,22 @@ when using a pool.
 - Exact live-image resume fingerprints are bounded to one 256 MiB buffer (up
   to 4K RGBA). Larger source images still process normally, but that object is
   deliberately not cached for resume instead of consuming 8K-scale memory.
-- The bake is synchronous because Blender data and bake operators must execute
-  on Blender's main thread. Blender can appear busy during large jobs; progress
-  remains visible in the system console and `run_log.txt`.
+- Baking runs in a separate Blender process by default. Snapshot preparation
+  can briefly pause the UI. The optional synchronous mode blocks Blender during
+  native baking; progress remains visible in the console and `run_log.txt`.
 - Texture corruption checks are intentionally shallow PNG/JPEG container checks,
   not full image decodes for every external file.
+# 1.5.0 candidate additions
+
+The sidebar now offers a separate background Blender worker, cancellation,
+checkpoint resume and verified result append. Source scenes remain open. Large
+snapshots and dependency hashing can briefly block preparation; native bake
+cancellation takes effect at the next safe boundary. Advanced settings include
+measured resource admission and an exact GPU selector. UV diagnostics and repair
+copies are available before baking.
+
+Choose **PNG 16-bit** for float-buffer graph baking of the four existing maps.
+Precision applies to loose PNGs; exporter re-encoding is unverified. Emission,
+height, DDS decoding and atlas consolidation remain outside this candidate.
+Native normal endpoint overshoot of at most one UNORM16 step is clamped and
+reported; other out-of-range or nonfinite samples are rejected.
