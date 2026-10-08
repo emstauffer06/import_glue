@@ -23,18 +23,20 @@ Your source objects, meshes, UVs, and materials are never edited. Each job works
 - **Resumes safely.** Parts whose inputs and outputs are unchanged since the last run are carried over; anything that changed is baked again.
 - **Runs headless.** A background launcher supports batch runs from the command line, with exit codes for scripting.
 
-## New in 1.6.0
+## New in 1.8.0
 
-- **Delivery targets.** Blender Native and Roblox outputs can be produced separately or together. The four-map workflow from 1.4.0 remains as **Legacy Four Maps**.
-- **Roblox emission.** Baked emission is converted to an emissive mask, tint and strength, measured against the delivered colour map, and refused when the error is too large unless you allow approximation.
-- **Background jobs.** Bakes run in a separate Blender process, with cancel, resume from verified checkpoints, and an explicit step to append finished results.
-- **Source snapshots.** Unsaved texture painting is captured, and your original file is left unchanged.
-- **Resource checks and UV diagnostics.** Free RAM and NVIDIA VRAM are measured before a job, one GPU can be chosen explicitly, and UV density, distortion and clearance are reported.
-- **PNG16.** The four legacy maps can be baked as true 16-bit PNG.
+- **Fit Roblox Material** (optional). Tunes each object's roughness and metalness maps by rendering them against the original material, checks the result on separate camera and light angles, and keeps the normal result if nothing helps.
+- **Capture Static Displacement** (optional). Turns a supported kind of displacement into real mesh geometry before the FBX export, within a triangle budget.
+- **Large source images.** 8K images can be verified and kept at full size in Blender Native output. Roblox maps stay capped at 4096.
+- **Preview Targets and Cost.** Shows the planned work, what will be refused and the estimated memory before you bake.
+- **Better Blender Native bakes** (from 1.7). Adaptive resolution with measured error, seam padding within UV islands, visual comparison galleries, and checkpoints so interrupted jobs resume without rebaking.
+- **More sources handled** (from 1.7). Dirty UDIM tiles, image sequences, OSL and IES files, custom colour configurations and Generated coordinates on deformed meshes.
 
-> **Test status:** 1.6.0 was validated in headless Blender 5.2.2 on Linux. The Blender GUI on Windows and import into Roblox Studio have not been tested with this build yet. The previous release, [1.4.0](https://github.com/emstauffer06/import_glue/releases/tag/v1.4.0-engine3.8), remains available.
+The fitting and displacement options are off by default and need **Allow Approximated Materials** turned on.
 
-> **Changed from 1.4.0:** the panel now defaults to **Blender + Roblox**. Choose **Legacy Four Maps** for the 1.4.0 behaviour. Materials the maps cannot carry are still refused by default; tick **Allow Approximated Materials** under Advanced to bake them, labelled `APPROXIMATED`.
+> **Requires Blender 5.2 or newer.** On an older Blender, use [1.6.0](https://github.com/emstauffer06/import_glue/releases/tag/v1.6.0-engine4.0), which works from Blender 4.3.
+
+> **Test status:** the package was installed and checked in Blender 5.2.2 on Windows and Linux, and the full test suite ran on Linux. Import into Roblox Studio has not been tested.
 
 ## Download and install
 
@@ -43,12 +45,13 @@ Your source objects, meshes, UVs, and materials are never edited. Each job works
 3. Enable **Import Glue PBR Baker**.
 4. In the 3D Viewport press **N**, open the **Roblox** tab, and use **Import Glue**.
 
-Requires Blender 4.3 or newer. Restart Blender after replacing an older version of the add-on.
+Requires Blender 5.2 or newer. Restart Blender after replacing an older version of the add-on.
 
 ## Documentation
 
-- **[Release notes for 1.6.0](docs/RELEASE_NOTES_1.6.0.md):** the new targets, background jobs, validation results and known limits.
-- **[Quick guide (PDF)](docs/import_glue_quick_guide.pdf):** a two-page visual walkthrough for 1.6.0: installing, baking in the background, the delivery targets, settings and common fixes.
+- **[Release notes for 1.8.0](docs/RELEASE_NOTES_1.8.0.md):** material fitting, displacement capture, large images, the 1.7 native-quality work, validation results and known limits.
+- **[Release notes for 1.6.0](docs/RELEASE_NOTES_1.6.0.md):** the delivery targets and background jobs.
+- **[Quick guide (PDF)](docs/import_glue_quick_guide.pdf):** a two-page visual walkthrough: installing, baking in the background, the delivery targets, settings and common fixes.
 - **[User guide](docs/USER_GUIDE.md):** the full manual for the four-map workflow, including the capability report, checkpoints and the visual check. Written for 1.4.0.
 - **[Release notes for 1.4.0](docs/RELEASE_NOTES_1.4.0.md):** what changed between 1.3.0 and 1.4.0.
 - **[Add-on README](import_glue_pbr_baker/README.md):** resolution settings, safety behavior, headless flags, and known engine limits.
