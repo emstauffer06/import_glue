@@ -23,15 +23,15 @@ from . import engine, material_capabilities, precheck, background_ui
 bl_info = {
     "name": "Import Glue PBR Baker",
     "author": "Sohra",
-    "version": (1, 6, 0),
-    "blender": (4, 3, 0),
+    "version": (1, 8, 0),
+    "blender": (5, 2, 0),
     "location": "3D Viewport > Sidebar > Roblox > Import Glue",
     "description": "Convert selected game-rip meshes into Roblox-ready PBR maps",
     "category": "Material",
 }
 
 
-ADDON_VERSION = "1.6.0"
+ADDON_VERSION = "1.8.0"
 ENGINE_CONFIG_KEYS = (
     "OUTPUT_ROOT",
     "RES",
@@ -45,6 +45,11 @@ ENGINE_CONFIG_KEYS = (
     "OUTPUT_PROFILE",
     "TARGET_PROFILE",
     "ROBLOX_TEXTURE_LIMIT",
+    "NATIVE_QUALITY",
+    "ROBLOX_MATERIAL_FIT",
+    "ROBLOX_FIT_SETTINGS",
+    "ROBLOX_GEOMETRY",
+    "ROBLOX_GEOMETRY_SETTINGS",
     "ALLOW_CPU_FALLBACK",
     "ALLOW_APPROXIMATION",
     "SOURCE_DIRS",
@@ -418,6 +423,16 @@ class EngineConfig:
             "OUTPUT_PROFILE": settings.output_profile,
             "TARGET_PROFILE": settings.target_profile,
             "ROBLOX_TEXTURE_LIMIT": int(settings.roblox_texture_limit),
+            "ROBLOX_MATERIAL_FIT": settings.roblox_material_fit,
+            "ROBLOX_FIT_SETTINGS": {"max_candidates": settings.roblox_fit_candidates,
+                                    "max_seconds": settings.roblox_fit_seconds},
+            "ROBLOX_GEOMETRY": settings.roblox_geometry,
+            "ROBLOX_GEOMETRY_SETTINGS": {"subdivisions": settings.roblox_geometry_subdivisions,
+                                         "max_triangles": settings.roblox_geometry_triangles},
+            "NATIVE_QUALITY": {"absolute_tolerance": float(settings.native_absolute_tolerance),
+                               "relative_tolerance": float(settings.native_relative_tolerance),
+                               "initial_resolution": settings.native_initial_resolution,
+                               "margin_px": settings.native_margin_pixels},
             "ALLOW_CPU_FALLBACK": settings.allow_cpu_fallback,
             "ALLOW_APPROXIMATION": settings.allow_approximation,
             "SOURCE_DIRS": _split_directories(settings.source_directories),
@@ -619,6 +634,25 @@ class IMPORTGLUE_PG_settings(PropertyGroup):
     uv_mip_level: IntProperty(name="UV Mip Level", default=0, min=0, max=12)
     uv_margin_pixels: FloatProperty(name="UV Margin Pixels", default=2, min=0, max=64)
     last_uv_report: StringProperty(name="UV Quality Report", subtype="FILE_PATH")
+    last_target_preflight: StringProperty(name="Target Preflight Report", subtype="FILE_PATH")
+    last_target_summary: StringProperty(name="Target Preflight Summary")
+    last_target_result_summary: StringProperty(name="Target Result Summary")
+    native_absolute_tolerance: FloatProperty(name="Native Absolute Error", default=0.025, min=0.0, max=1.0,
+        description="Maximum sampled error allowance added to the relative allowance; failed fields remain native")
+    native_relative_tolerance: FloatProperty(name="Native Relative Error", default=0.01, min=0.0, max=1.0,
+        description="Relative component of the finite reference comparison; not a mathematical error bound")
+    native_initial_resolution: IntProperty(name="Adaptive Starting Resolution", default=128, min=16, max=4096)
+    native_margin_pixels: IntProperty(name="Native Seam Padding", default=8, min=1, max=32,
+        description="Pad uncovered texels without overwriting other UV islands")
+    roblox_material_fit: BoolProperty(name="Fit Roblox Material", default=False,
+        description="Measure roughness/metalness candidates against source renders; requires Allow Approximation")
+    roblox_fit_candidates: IntProperty(name="Fit Candidate Budget", default=12, min=1, max=32)
+    roblox_fit_seconds: FloatProperty(name="Fit Time Budget (seconds)", default=300, min=10, max=3600,
+        description="Checked between renders; a Blender render cannot be preempted by this budget")
+    roblox_geometry: BoolProperty(name="Capture Static Displacement", default=False,
+        description="Convert supported displacement to private mesh geometry within a triangle budget; requires Allow Approximation")
+    roblox_geometry_subdivisions: IntProperty(name="Displacement Subdivisions", default=2, min=0, max=6)
+    roblox_geometry_triangles: IntProperty(name="Displacement Triangle Budget", default=20000, min=1, max=1000000)
     scope: EnumProperty(
         name="Scope",
         items=(
@@ -1164,10 +1198,25 @@ class IMPORTGLUE_PT_main(Panel):
         output.prop(settings, "target_profile")
         if settings.target_profile in {"ROBLOX", "BOTH"}:
             output.prop(settings, "roblox_texture_limit")
+            output.prop(settings, "roblox_material_fit")
+            if settings.roblox_material_fit:
+                output.prop(settings, "roblox_fit_candidates")
+                output.prop(settings, "roblox_fit_seconds")
+            output.prop(settings, "roblox_geometry")
+            if settings.roblox_geometry:
+                output.prop(settings, "roblox_geometry_subdivisions")
+                output.prop(settings, "roblox_geometry_triangles")
+            if settings.roblox_material_fit or settings.roblox_geometry:
+                output.label(text="Requires Allow Approximation", icon="INFO")
         if settings.target_profile == "LEGACY":
             output.prop(settings, "output_profile")
         else:
-            output.label(text="New targets rerun from source; no legacy resume")
+            output.label(text="Verified target, object and native field recovery")
+            if settings.target_profile in {"BLENDER_NATIVE", "BOTH"} and settings.show_advanced:
+                output.prop(settings, "native_absolute_tolerance")
+                output.prop(settings, "native_relative_tolerance")
+                output.prop(settings, "native_initial_resolution")
+                output.prop(settings, "native_margin_pixels")
         output.prop(settings, "source_normal_is_directx")
 
         quality = layout.box()

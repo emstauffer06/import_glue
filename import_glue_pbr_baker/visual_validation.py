@@ -62,6 +62,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 import zlib
@@ -75,7 +76,7 @@ from mathutils.kdtree import KDTree
 from .shader_graph import material_dependencies
 
 SCHEMA_VERSION = 1
-MODULE_VERSION = "1.1.0"
+MODULE_VERSION = "1.2.0"
 REPORT_NAME = "report.json"
 REPORT_HASH_NAME = "report.json.sha256"
 PROBE_UV = "__ig_visual_probe__"
@@ -130,7 +131,8 @@ LIGHTING = {
                   "description": "black world; hard sun 20 deg from the view axis toward camera-up"},
 }
 DISPLAY_TRANSFORM = (
-    "Display PNGs only: render RGB is un-premultiplied, clipped to [0,1] and encoded with the "
+    "Display PNGs only: render RGB is un-premultiplied, converted from the active OCIO "
+    "scene-linear space to linear Rec.709, clipped to [0,1] and encoded with the "
     "sRGB transfer function (no exposure, look, AgX or Filmic); alpha is written as straight "
     "alpha. Surface colour uses the same encoding; metal/rough/alpha are written as linear "
     "grey and the object-space normal as its 0.5*n+0.5 encoding. Uncovered texels are "
@@ -239,6 +241,7 @@ def default_settings() -> Dict[str, Any]:
         "device": "CPU",
         "views": list(VIEWS),
         "lighting_presets": list(LIGHTING_PRESETS),
+        "render_scales": [1.0],
         "layers": list(LAYERS),
         "keep_linear": True,
         "channel_references": {},
@@ -248,6 +251,7 @@ def default_settings() -> Dict[str, Any]:
 
 _OPTIONAL_DEFAULTS = {
     "probe_resolution": None, "layers": list(LAYERS), "keep_linear": True, "channel_references": {},
+    "render_scales": [1.0],
 }
 
 
@@ -348,6 +352,13 @@ def validate_settings(settings: Any) -> Tuple[Dict[str, Any], List[str]]:
     needs_render = "render" in layers
     _choices(resolved["views"], "views", VIEWS, not needs_render)
     _choices(resolved["lighting_presets"], "lighting_presets", LIGHTING_PRESETS, not needs_render)
+    scales = resolved["render_scales"]
+    if not isinstance(scales, list) or not 1 <= len(scales) <= 4:
+        raise ValueError("render_scales must contain one to four framing scales")
+    for scale in scales:
+        _number(scale, "render_scales entry", 0.5, 8.0)
+    if len(set(scales)) != len(scales):
+        raise ValueError("render_scales must be unique")
     if not isinstance(resolved["keep_linear"], bool):
         raise ValueError("keep_linear must be a bool")
     references = resolved["channel_references"]
@@ -460,6 +471,9 @@ class _Run:
         self.artifacts: Dict[str, Dict[str, Any]] = {}
         self.render_count = 0
         self.bake_count = 0
+        self.display_processor = None
+        self.color_contract = {}
+        self.data_space = None
         # The probe size the surface layer actually uses ("auto" resolves per mesh).
         self.probe_size = settings["probe_resolution"] if isinstance(settings["probe_resolution"], int) else None
 
@@ -857,10 +871,21 @@ def _device(requested: str) -> Tuple[Dict[str, Any], Optional[str]]:
 
 
 def _setup_scene(run: _Run, user_scene: Any) -> None:
+    from . import ocio_capture
+    import PyOpenColorIO as ocio
+    contract = ocio_capture.target_contract()
+    if not contract["native_supported"]:
+        raise ValueError("Visual color reference unavailable: " + "; ".join(contract["native_reasons"]))
+    run.data_space = contract["roles"]["data"]
+    linear = contract["roles"]["scene_linear"]
+    processor = ocio.Config.GetProcessorToBuiltinColorSpace(ocio.GetCurrentConfig(), linear, "lin_rec709_scene")
+    run.display_processor = processor.getDefaultCPUProcessor()
+    run.color_contract = {"metric_space": linear, "data_space": run.data_space,
+                          "png_linear_space": "lin_rec709_scene", "png_processor": processor.getCacheID()}
     scene = bpy.data.scenes.new(run.name("scene"))
     run.scene = scene
     run.view_layer = scene.view_layers[0]
-    scene.frame_current = user_scene.frame_current
+    scene.frame_set(user_scene.frame_current, subframe=user_scene.frame_subframe)
     scene.render.engine = "CYCLES"
     scene.render.use_compositing = False
     scene.render.use_sequencer = False
@@ -877,6 +902,7 @@ def _setup_scene(run: _Run, user_scene: Any) -> None:
     except Exception:
         pass
     cycles = scene.cycles
+    cycles.shading_system = user_scene.cycles.shading_system
     cycles.device = run.settings["device"]
     cycles.samples = run.settings["samples"]
     cycles.use_adaptive_sampling = False
@@ -904,14 +930,21 @@ def _make_proxy(run: _Run, obj: Any, label: str) -> Tuple[Any, Dict[str, Any]]:
         mesh = bpy.data.meshes.new_from_object(evaluated, preserve_all_data_layers=True,
                                                depsgraph=depsgraph)
         source_mesh = evaluated.data
+        transform, color, pass_index = evaluated.matrix_world.copy(), tuple(evaluated.color), evaluated.pass_index
     except Exception as exc:
         mesh = obj.data.copy()
         source_mesh = obj.data
+        transform, color, pass_index = obj.matrix_world.copy(), tuple(obj.color), obj.pass_index
         info["evaluated"] = False
         info["notes"].append("modifier evaluation unavailable (%s); base mesh used" % _text(exc, 200))
     run.track("meshes", mesh)
     mesh.name = run.name(label + "_mesh")
-    effective = [slot.material for slot in obj.material_slots]
+    # Evaluated IDs are owned by the depsgraph and can be freed at its next
+    # update. Persistent proxy meshes must refer to original material IDs.
+    effective = [getattr(material, "original", material) if material else None for material in mesh.materials]
+    for index, slot in enumerate(obj.material_slots):
+        if slot.link == "OBJECT" and index < len(effective):
+            effective[index] = slot.material
     for index, material in enumerate(effective):
         if index < len(mesh.materials):
             mesh.materials[index] = material
@@ -921,15 +954,39 @@ def _make_proxy(run: _Run, obj: Any, label: str) -> Tuple[Any, Dict[str, Any]]:
     if render_uv is not None and render_uv in mesh.uv_layers:
         mesh.uv_layers[render_uv].active_render = True
     proxy = run.track("objects", bpy.data.objects.new(run.name(label), mesh))
-    proxy.matrix_world = obj.matrix_world.copy()
-    proxy.color = obj.color
-    proxy.pass_index = obj.pass_index
+    proxy.matrix_world = transform
+    proxy.color = color
+    proxy.pass_index = pass_index
     run.scene.collection.objects.link(proxy)
     proxy.hide_render = False
+    if obj.modifiers or obj.data.shape_keys:
+        from . import native_baker, native_graph
+        used = {face.material_index for face in mesh.polygons}
+        plans = [(index, native_graph.inspect_material(material)) for index, material in enumerate(effective)
+                 if index in used and material is not None and material.use_nodes]
+        generated = [(index, plan) for index, plan in plans if plan["uses_generated_coordinates"]]
+        if generated:
+            if any(plan["retained_domains"] for _, plan in generated):
+                raise ValueError("Generated-coordinate visual reference with volume/displacement requires contextual geometry")
+            preserved = native_baker._preserve_texture_space(obj, proxy, {})
+            private_materials, private_groups = [], []
+            try:
+                for index, _plan in generated:
+                    copied = native_graph.clone_material(effective[index], run.name("generated_material"),
+                                                         private_materials, private_groups)
+                    native_baker._replace_generated(copied, preserved["attribute"])
+                    mesh.materials[index] = copied
+            finally:
+                for block in private_materials:
+                    run.track("materials", block)
+                for block in private_groups:
+                    run.track("node_groups", block)
+            info["generated_coordinates"] = preserved
+            info["notes"].append("Generated coordinates preserved from original basis/texture space on verified deformation topology")
     info["texture_uv"] = _render_uv_name(mesh)
     info["uv_layers"] = [layer.name for layer in mesh.uv_layers]
     info["modifiers"] = [m.type for m in obj.modifiers]
-    if not info["evaluated"] and obj.modifiers:
+    if not info["evaluated"] and (obj.modifiers or obj.data.shape_keys):
         info["unevaluated_modifiers"] = True
     return proxy, info
 
@@ -1345,7 +1402,7 @@ def _target_image(run: _Run, label: str) -> Any:
     size = run.probe_size
     image = run.track("images", bpy.data.images.new(run.name(label), size, size, alpha=True,
                                                      float_buffer=True))
-    image.colorspace_settings.name = "Non-Color"
+    image.colorspace_settings.name = run.data_space
     image.pixels.foreach_set(np.full(size * size * 4, _SENTINEL, np.float32))
     return image
 
@@ -1762,11 +1819,14 @@ def _mask_png(classes: np.ndarray) -> np.ndarray:
     return palette[classes][::-1]
 
 
-def _display_rgba(rgba: np.ndarray, encode: bool) -> np.ndarray:
+def _display_rgba(rgba: np.ndarray, encode: bool, processor: Any = None) -> np.ndarray:
     alpha = np.clip(np.nan_to_num(rgba[..., 3]), 0.0, 1.0)
     rgb = rgba[..., :3].astype(np.float64)
     safe = np.where(alpha > 1e-6, alpha, 1.0)[..., None]
     rgb = np.where(alpha[..., None] > 1e-6, rgb / safe, 0.0)
+    if encode and processor is not None:
+        rgb = np.ascontiguousarray(rgb, dtype=np.float32)
+        processor.applyRGB(rgb)
     rgb = _srgb_encode(rgb) if encode else np.clip(rgb, 0.0, 1.0)
     out = np.concatenate([rgb, alpha[..., None]], -1)
     return _to_u8(out)[::-1]
@@ -1948,7 +2008,7 @@ def _surface_layer(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any],
             rgba = np.concatenate([np.repeat(data, 3, -1) if data.shape[-1] == 1 else data,
                                    valid[..., None].astype(np.float32)], -1)
             path = run.artifact("surface/%s_%s.png" % (channel, role), "surface", role, channel)
-            _write_bytes(path, _png_bytes(_display_rgba(rgba, encode)))
+            _write_bytes(path, _png_bytes(_display_rgba(rgba, encode, run.display_processor)))
         path = run.artifact("surface/%s_difference.png" % channel, "surface", "difference", channel)
         _write_bytes(path, _png_bytes(_difference_png(error, classes, thresholds)))
         if channel == "normal" and unreliable_normal:
@@ -2020,6 +2080,32 @@ def _measure_sampling(coverage: Dict[str, Any], findings: List[Dict[str, Any]], 
 
 
 def _render_layer(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any]) -> None:
+    """Every requested framing scale needs its own coverage and error verdict.
+
+    Higher scales reduce projected object size at a fixed render resolution,
+    exercising texture minification. This measures Cycles filtering, not the
+    Roblox texture-streaming/mipmap implementation. Scale < 1 is a declared
+    central close-up and does not establish coverage of the complete object.
+    """
+    scales = run.settings["render_scales"]
+    records = {}
+    for scale in scales:
+        partial = {"coverage": {"render": {}, "layers_compared": []},
+                   "metrics": {}, "findings": []}
+        _render_layer_at_scale(run, partial, proxies, float(scale))
+        key = format(float(scale), ".17g")
+        records[key] = partial["coverage"]["render"]
+        report["findings"].extend(partial["findings"])
+        report["metrics"].setdefault("render", {}).update(partial["metrics"].get("render", {}))
+        if "render" in partial["coverage"]["layers_compared"] and "render" not in report["coverage"]["layers_compared"]:
+            report["coverage"]["layers_compared"].append("render")
+    # Keep the established one-scale coverage fields for report consumers.
+    first = records.get("1", records[next(iter(records))])
+    report["coverage"]["render"] = {**first, "scales": records,
+        "status": "COMPARED" if all(row.get("status") == "COMPARED" for row in records.values()) else "INSUFFICIENT"}
+
+
+def _render_layer_at_scale(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any], scale: float) -> None:
     settings = run.settings
     tolerances = settings["tolerances"]
     rule = tolerances["coverage"]
@@ -2075,10 +2161,11 @@ def _render_layer(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any]) ->
             coverage["views_without_coverage"].append(view)
             continue
         camera.matrix_world = Matrix.Translation(Vector(tuple(frame["location"]))) @ frame["rotation"].to_4x4()
-        camera_data.ortho_scale = frame["scale"]
+        camera_data.ortho_scale = frame["scale"] * scale
         camera_data.clip_start = 1e-4 * frame["scale"]
         camera_data.clip_end = frame["clip_end"]
-        tag = _VIEW_FILE[view]
+        prefix = "" if scale == 1.0 else "scale_%s_" % format(scale, ".17g")
+        tag = prefix + _VIEW_FILE[view]
         geo = {}
         scene.world = worlds["black"]
         sun.hide_render = True
@@ -2113,10 +2200,12 @@ def _render_layer(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any]) ->
                 sun.hide_render = False
             else:
                 sun.hide_render = True
-            images, paths = {}, {}
+            images, paths, elapsed = {}, {}, {}
             for side in ("source", "output"):
                 solo(side)
+                started = time.perf_counter()
                 images[side], paths[side] = render("%s_%s_%s" % (tag, preset, side))
+                elapsed[side] = time.perf_counter() - started
             ref, out = images["source"], images["output"]
             finite = np.isfinite(ref).all(-1) & np.isfinite(out).all(-1)
             valid = union & finite
@@ -2125,8 +2214,11 @@ def _render_layer(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any]) ->
             classes[interior] = 1
             classes[union & mismatch] = 3
             classes[union & ~finite] = 4
-            key = "%s/%s" % (view, preset)
-            entry = {"coverage": {"union_pixels": int(union.sum()), "interior_pixels": int(interior.sum()),
+            key = ("" if scale == 1.0 else "scale_%s/" % format(scale, ".17g")) + "%s/%s" % (view, preset)
+            entry = {"observed_render_seconds": elapsed,
+                     "timing_scope": "One paired render including compilation and EXR IO; not a throughput benchmark",
+                     "framing_scale": scale,
+                     "coverage": {"union_pixels": int(union.sum()), "interior_pixels": int(interior.sum()),
                                   "silhouette_mismatch_pixels": int((union & mismatch).sum()),
                                   "invalid_pixels": int((union & ~finite).sum()),
                                   "covered": view in coverage["covered_views"]}}
@@ -2150,11 +2242,14 @@ def _render_layer(run: _Run, report: Dict[str, Any], proxies: Dict[str, Any]) ->
                                          "%d covered pixels are non-finite" % entry["coverage"]["invalid_pixels"]))
             for role, side in (("reference", "source"), ("output", "output")):
                 path = run.artifact("%s_%s.png" % (base, role), "render", role, key)
-                _write_bytes(path, _png_bytes(_display_rgba(images[side], True)))
+                _write_bytes(path, _png_bytes(_display_rgba(images[side], True, run.display_processor)))
                 if keep:
                     rel = "render/linear/%s_%s_%s.exr" % (tag, preset, role)
                     shutil.copyfile(paths[side], run.artifact(rel, "render", "linear", key))
             _write_bytes(run.artifact("%s_mask.png" % base, "render", "mask", key), _png_bytes(_mask_png(classes)))
+    # A later scale gets an independent lighting rig. Do not let this scale's
+    # final highlight/grazing sun contaminate the next scale's diffuse preset.
+    sun.hide_render = True
     insufficient = False
     if len(coverage["covered_views"]) < rule["min_covered_views"]:
         findings.append(_finding(
@@ -2806,6 +2901,8 @@ def _scope(report: Dict[str, Any]) -> None:
         scope = "surface channels in a shared correspondence + fixed-camera paired renders"
     else:
         scope = "nothing compared"
+    if "render" in compared:
+        scope += "; projected framing scales %s (Cycles filtering; not Roblox renderer parity)" % report["settings"]["render_scales"]
     time_dependent = sorted({
         name for layer in LAYERS
         for name, rows in (report["coverage"][layer].get("unsupported_materials") or {}).items()
@@ -2829,12 +2926,20 @@ def _compare(run: _Run, report: Dict[str, Any], source_object: Any, output_objec
     settings = run.settings
     run.stage = "proxies"
     _setup_scene(run, user_scene)
+    report["color_contract"] = run.color_contract
     proxies, infos = {}, {}
     for side, obj in (("source", source_object), ("output", output_object)):
         proxies[side], infos[side] = _make_proxy(run, obj, side)
         if infos[side]["notes"]:
             report["findings"].extend(_finding("PROXY_NOTE", NOTE, "report", side, note)
                                       for note in infos[side]["notes"])
+        if infos[side].get("unevaluated_modifiers"):
+            for layer in settings["layers"]:
+                report["coverage"][layer].update(status=UNSUPPORTED_REFERENCE)
+                report["findings"].append(_finding(
+                    "UNEVALUATED_GEOMETRY", UNSUPPORTED_REFERENCE, layer, side,
+                    "Evaluated geometry is unavailable; the base mesh cannot certify modifier/shape-key appearance"))
+            return
     run.stage = "geometry"
     invalid = {side: _non_finite_geometry(proxies[side]) for side in proxies}
     if any(invalid.values()):

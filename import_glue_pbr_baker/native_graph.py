@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import bpy
 
-from . import shader_graph
+from . import shader_graph, shader_resources
 
 STATIC = frozenset({
     "ShaderNodeMath", "ShaderNodeVectorMath", "ShaderNodeMapRange", "ShaderNodeClamp",
@@ -96,8 +96,9 @@ def classify_input(socket, context=()):
 
 def inspect_material(material):
     fields, blockers, seen, generated = [], [], set(), False
+    resources, resource_seen = [], set()
 
-    def visit(node, output, context):
+    def visit(node, output, context, include_fields=True):
         nonlocal generated
         kind = node.bl_idname
         path = [n.name for n in context]
@@ -107,8 +108,18 @@ def inspect_material(material):
             blockers.append({"code": "MOVIE_EXCLUDED", "path": location,
                              "reason": "Required movie textures are excluded by this output policy."})
         if kind in {"ShaderNodeScript", "ShaderNodeTexIES"} and getattr(node, "mode", "") == "EXTERNAL":
-            blockers.append({"code": "UNCAPTURED_EXTERNAL_SHADER_RESOURCE", "path": location,
-                             "reason": "Required external OSL/IES file has no verified self-contained capture; use an internal text resource or retain the source scene."})
+            proof = shader_resources.inspect_node(node)
+            if not proof["supported"]:
+                blockers.append({"code": "UNCAPTURED_EXTERNAL_SHADER_RESOURCE", "path": location,
+                                 "reason": proof["reason"]})
+            elif (tuple(path),node.name) not in resource_seen:
+                resource_seen.add((tuple(path),node.name))
+                resources.append({"group_path": path,"node": node.name,"kind": proof["kind"]})
+        if kind == "ShaderNodeScript" and getattr(node,"mode","") == "INTERNAL":
+            try:
+                shader_resources.validate_internal_node(node)
+            except shader_resources.ResourceError as exc:
+                blockers.append({"code":"UNVERIFIED_INTERNAL_OSL", "path":location, "reason":str(exc)})
         if kind == "ShaderNodeObjectInfo" and output.name == "Random":
             blockers.append({"code": "OBJECT_RANDOM_CONTEXT", "path": location,
                              "reason": "A copied object changes Random; no equivalent captured field is available."})
@@ -122,7 +133,7 @@ def inspect_material(material):
             vector = node.inputs.get("Vector")
             if vector is not None and not shader_graph.active_links(vector):
                 generated = True
-        if output.type != "SHADER" or node.type in {"GROUP", "GROUP_INPUT", "REROUTE"}:
+        if not include_fields or output.type != "SHADER" or node.type in {"GROUP", "GROUP_INPUT", "REROUTE"}:
             return
         for index, target in enumerate(node.inputs):
             if not target.enabled or target.type not in {"VALUE", "RGBA", "VECTOR"}:
@@ -140,6 +151,38 @@ def inspect_material(material):
 
     dependency = shader_graph.material_dependencies(material, visit=visit)
     output = material.node_tree.get_output_node("CYCLES")
+    # Native libraries preserve engine-specific output roots as well. Walk
+    # their resources conservatively; only Cycles fields are candidates for
+    # sampling. This avoids pruning an Eevee root while silently clearing its
+    # images or leaving an excluded movie reachable through that root.
+    pending = [(socket,()) for node in material.node_tree.nodes
+               if node.type == "OUTPUT_MATERIAL" and node != output for socket in node.inputs]
+    alternate_seen = set()
+    while pending:
+        current, parents = pending.pop()
+        key = (current.as_pointer(),tuple(node.as_pointer() for node in parents))
+        if key in alternate_seen:
+            continue
+        alternate_seen.add(key)
+        if not current.is_output:
+            pending.extend((link.from_socket,parents) for link in shader_graph.active_links(current))
+            continue
+        node = current.node
+        visit(node,current,parents,False)
+        image = getattr(node,"image",None)
+        if image is not None:
+            dependency["images"].add(image.as_pointer())
+        if node.type == "GROUP" and node.node_tree:
+            inner = _active_output(node.node_tree)
+            match = _socket(inner.inputs,current) if inner else None
+            if match is not None:
+                pending.append((match,parents+(node,)))
+        elif node.type == "GROUP_INPUT" and parents:
+            match = _socket(parents[-1].inputs,current)
+            if match is not None:
+                pending.append((match,parents[:-1]))
+        else:
+            pending.extend((socket,parents) for socket in shader_graph._inputs(node,current,parents))
     domains = [name for name in ("Volume", "Displacement")
                if output is not None and output.inputs.get(name) is not None
                and shader_graph.active_links(output.inputs[name])]
@@ -156,6 +199,7 @@ def inspect_material(material):
                      "reason": item["message"]} for item in dependency["diagnostics"]
                     if item["severity"] == "ERROR")
     return {"fields": fields, "blockers": blockers, "uses_generated_coordinates": generated,
+            "external_resources": resources,
             "retained_domains": domains,
             "dependency": {**dependency, "images": sorted(dependency["images"])}}
 

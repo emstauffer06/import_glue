@@ -1,12 +1,29 @@
-# Import Glue PBR Baker 1.5.0 / engine 3.9 candidate
+# Import Glue PBR Baker 1.8.0 / engine 4.2 candidate
 
-This candidate adds background Blender jobs, cancellation, verified checkpoint
-resume and explicit result append. The sidebar also includes UV diagnostics,
-repair copies, measured resource admission, one-GPU selection and true PNG16
-graph baking. See the candidate additions below for limits.
+Choose **Blender Native**, **Roblox**, **Blender + Roblox** or **Legacy Four Maps**.
+The default add-on target is Blender + Roblox. This candidate adds adaptive
+native field sampling with island-aware padding and independent error checks,
+native comparison galleries across lights/views/projected sizes, shared-field
+and image reuse, private graph pruning, target/object/field recovery, and
+per-target preflight with verified partial-native result append.
 
-The add-on and background launcher convert selected game-rip meshes into duplicated
-Roblox-oriented meshes and four PBR PNG maps per part:
+Native materials preserve their closure graphs. Eligible static fields become
+signed/HDR float32 EXR only when the declared finite quality checks pass; other
+fields remain procedural. Roblox receives five PNG8 maps (including emissive
+mask), triangulated FBX and a binding manifest/Luau importer. Upload your assets
+and provide their real Roblox asset IDs. Studio import testing is not part of
+this candidate's validation.
+
+Static capture includes dirty UDIM, proved sequence frames, bounded OSL/IES and
+verified custom OCIO dependencies. Videos, unproved shader/geometry context and
+incompatible target materials refuse explicitly. Large live-image fingerprints use a file-backed contiguous extraction with RAM
+and temporary-disk admission. 8K source preservation is tested; full native capture
+peaked around 10 GiB RAM on the fixture. This is not a constant-memory operation.
+Custom OCIO files remain external under checksums. Finite sampling/render tests
+do not establish fidelity for every shader, filter or view.
+
+The retained **Legacy Four Maps** workflow converts selected game-rip meshes into
+duplicated Roblox-oriented meshes and four PBR PNG maps per part:
 
 - `_ALB` — albedo
 - `_MET` — metalness
@@ -17,17 +34,33 @@ The source objects, source meshes, source UVs, and source materials are not
 edited. The pipeline creates a new output collection and writes a manifest,
 run log, resume list, and PNG files.
 
+## Optional Roblox approximation controls
+
+Enable **Allow Approximation**, then **Fit Roblox Material** and/or **Capture
+Static Displacement** in the Roblox delivery controls. Fitting tests bounded
+roughness/metalness changes against source renders; only an improvement that
+survives separate camera/light comparisons is accepted. Otherwise the baseline
+is retained with an explicit reason. Albedo, normals and emissive maps stay fixed.
+This is a finite Cycles comparison, not a Roblox renderer certificate.
+
+Geometry capture supports direct object-space scalar Displacement Only, using a
+constant or supported static UV height image. It refuses residual bump, vector or
+arbitrary procedural displacement and unproved coordinate contexts. Subdivision
+is bounded by the requested limit and the engine triangle budget. Sources remain
+unchanged. Final visual checks run after fitting and geometry conversion.
+
 ## Install
 
-1. Use `import_glue_pbr_baker-1.5.0-engine3.9.zip`; do not unzip it.
+1. Use `import_glue_pbr_baker-1.8.0-engine4.2.zip`; do not unzip it.
 2. In Blender, open **Edit > Preferences > Add-ons**.
 3. Choose **Install from Disk**, select the archive, then enable
    **Import Glue PBR Baker**.
 4. In the 3D Viewport press **N**, open the **Roblox** tab, and use
    **Import Glue**.
 
-The manifest minimum is Blender 4.3. This candidate is tested in headless Linux
-Blender 5.2.2; Windows Blender GUI validation is pending. Restart Blender after replacing the add-on so
+The minimum is Blender 5.2. Tests use Blender 5.2.2 on Windows and Linux, including
+installed-package operator checks in disposable profiles. Interactive GUI appearance
+is not certified by those tests. Restart Blender after replacing the add-on so
 its imported Python modules reload.
 
 To rebuild the deterministic archive from the source repository root, run:
@@ -48,7 +81,14 @@ can exceed memory on complex graphs. Recovery does not reduce resolution.
    are staged elsewhere.
 4. Press **Run Import Glue**.
 
-Outputs are written under:
+Native/Roblox deliveries create a unique `import_glue_<target>_<id>` directory
+under Output Root, with `delivery.json`, target reports and appendable native
+libraries. **Preview Targets and Cost** explains the proposed work.
+**Resume Saved Job** retries its immutable snapshot and validates checkpoints.
+**Append Available Results** loads a verified complete result or the successful
+native library from a partial delivery.
+
+Legacy outputs are written under:
 
 ```text
 <blend folder>/<blend name>_exports/rbx_pbr_smart[N]/

@@ -12,7 +12,9 @@ import math
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
+import tempfile
 import time
 
 SCHEMA = 1
@@ -20,21 +22,80 @@ SCHEMA = 1
 
 def source_statistics(objects, images=(), source_path=""):
     """Cheap source counts, not evaluated modifier geometry or a memory guarantee."""
-    vertices = triangles = pixels = 0
+    vertices = triangles = pixels = max_pixels = 0
+    unknown_tiles, tile_count, uncertainties = 0, 0, []
+    objects = list(objects)
+    # Source-invariance hashes visit every original material slot and node,
+    # including unreachable resources, so their extraction cost also counts.
+    def identity(value):
+        return value.as_pointer() if hasattr(value, "as_pointer") else id(value)
+    all_images = {identity(image): image for image in images}
+    trees = [material.node_tree for obj in objects for slot in getattr(obj, "material_slots", ())
+             if (material := getattr(slot, "material", None)) is not None and getattr(material, "node_tree", None) is not None]
+    visited = set()
+    while trees:
+        tree = trees.pop()
+        if identity(tree) in visited:
+            continue
+        visited.add(identity(tree))
+        for node in tree.nodes:
+            image = getattr(node, "image", None)
+            if image is not None:
+                all_images[identity(image)] = image
+            if getattr(node, "node_tree", None) is not None:
+                trees.append(node.node_tree)
     for obj in objects:
         if getattr(obj, "type", None) != "MESH":
             continue
         vertices += len(obj.data.vertices)
         triangles += sum(max(0, len(face.vertices) - 2) for face in obj.data.polygons)
-    for image in images:
-        if len(image.size) >= 2:
-            pixels += max(0, int(image.size[0])) * max(0, int(image.size[1]))
+    for image in all_images.values():
+        if getattr(image, "source", "") == "MOVIE":
+            # Even querying movie size can start a decoder and alter Blender's
+            # image state. Videos are outside the static capture contract.
+            unknown_tiles += 1
+            pixels += 8192 ** 2
+            max_pixels = max(max_pixels, 8192 ** 2)
+            uncertainties.append("Video image has no verified static dimensions: " + str(getattr(image, "name", "image")))
+            continue
+        exposed = list(getattr(image, "size", (0, 0)))
+        exposed_pixels = max(0, int(exposed[0])) * max(0, int(exposed[1])) if len(exposed) >= 2 else 0
+        if getattr(image, "source", "") == "TILED":
+            sizes = []
+            for tile in getattr(image, "tiles", ()):
+                value = list(getattr(tile, "size", (0, 0)))
+                sizes.append(max(0, int(value[0])) * max(0, int(value[1])) if len(value) >= 2 else 0)
+            if not sizes:
+                sizes = [0]
+            tile_count += len(sizes)
+            for count in sizes:
+                if count:
+                    pixels += count
+                    max_pixels = max(max_pixels, count)
+                else:
+                    unknown_tiles += 1
+                    # This is a planning fallback, explicitly not a proven
+                    # upper bound. Strict admission refuses unknown dimensions.
+                    fallback = max(8192 ** 2, exposed_pixels, max(sizes))
+                    pixels += fallback
+                    max_pixels = max(max_pixels, fallback)
+            if any(not count for count in sizes):
+                uncertainties.append("UDIM tile dimensions unavailable: " + str(getattr(image, "name", "image")))
+        else:
+            pixels += exposed_pixels
+            max_pixels = max(max_pixels, exposed_pixels)
+            if not exposed_pixels:
+                unknown_tiles += 1
+                pixels += 8192 ** 2
+                max_pixels = max(max_pixels, 8192 ** 2)
+                uncertainties.append("Image dimensions unavailable: " + str(getattr(image, "name", "image")))
     try:
         size = os.path.getsize(source_path)
     except OSError:
         size = 0
     return {"vertices": vertices, "triangles": triangles,
-            "texture_pixels": pixels, "source_bytes": size}
+            "texture_pixels": pixels, "max_texture_pixels": max_pixels, "source_bytes": size, "udim_tiles": tile_count,
+            "unknown_texture_tiles": unknown_tiles, "texture_size_uncertainties": uncertainties}
 _MIB = 1024 ** 2
 _POLICY_KEYS = frozenset({"enforce", "reserve_fraction", "estimated_ram_bytes",
                           "estimated_vram_bytes", "device_id"})
@@ -159,6 +220,13 @@ def collect_snapshot(*, include_gpu=True):
             result["unavailable"].append("RAM adapter not implemented for " + result["platform"])
     except (OSError, ValueError, AttributeError) as exc:
         result["unavailable"].append("RAM: " + str(exc))
+    try:
+        directory = tempfile.gettempdir()
+        result["temporary_disk"] = {"path": directory, "available_bytes": shutil.disk_usage(directory).free,
+                                    "source": "temporary directory filesystem free space"}
+    except (OSError, ValueError) as exc:
+        result["temporary_disk"] = {"available_bytes": None}
+        result["unavailable"].append("Temporary disk: " + str(exc))
     if include_gpu:
         try:
             process = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free,utilization.gpu",
@@ -170,23 +238,58 @@ def collect_snapshot(*, include_gpu=True):
     return result
 
 
-def estimate_job(source_stats=None, *, resolution=1024):
+def estimate_job(source_stats=None, *, resolution=1024, target="LEGACY", quality_settings=None):
     """Planning estimate, not an allocation bound. No speed/fit guarantee is made."""
     stats = source_stats or {}
     if not isinstance(stats, dict):
         raise ValueError("source_stats must be a dictionary")
     counts = {key: _positive_integer(stats.get(key, 0), key)
-              for key in ("vertices", "triangles", "texture_pixels", "source_bytes")}
+              for key in ("vertices", "triangles", "texture_pixels", "source_bytes", "objects",
+                          "eligible_fields", "material_nodes", "material_instances", "udim_tiles", "unknown_texture_tiles")}
+    # Old capture manifests omit the largest image; conservatively use the
+    # total decoded image count rather than silently estimating zero overhead.
+    counts["max_texture_pixels"] = _positive_integer(stats.get("max_texture_pixels", counts["texture_pixels"]), "max_texture_pixels")
     _positive_integer(resolution, "resolution")
     if not 4 <= resolution <= 8192:
         raise ValueError("resolution outside supported limits")
     # Float RGBA input plus evaluated/copy geometry, output/temporary passes and a fixed runtime allowance.
     geometry = counts["vertices"] * 256 + counts["triangles"] * 384
     textures = counts["texture_pixels"] * 16
+    fingerprint_bytes = counts["max_texture_pixels"] * 16
+    fingerprint_disk = fingerprint_bytes if fingerprint_bytes > 256 * _MIB else 0
     passes = resolution * resolution * 16 * 8
-    return {"ram_bytes": 512 * _MIB + counts["source_bytes"] * 2 + geometry * 3 + textures * 2 + passes,
-            "vram_bytes": 256 * _MIB + geometry * 2 + textures + passes,
+    if target not in {"LEGACY", "BLENDER_NATIVE", "ROBLOX", "BOTH"}:
+        raise ValueError("Unknown output target")
+    native = target in {"BLENDER_NATIVE", "BOTH"}
+    # Native outputs remain resident while later objects/targets bake. Include
+    # cloned graph storage, retained float fields and positive/negative probes,
+    # reference samples, island masks, comparisons and padded output buffers.
+    retained_fields = counts["eligible_fields"] * resolution * resolution * 16 if native else 0
+    graph_copies = counts["material_nodes"] * 4096 * 3 + counts["material_instances"] * 65536 if native else 0
+    native_temps = resolution * resolution * 16 * 24 if native else 0
+    retained_roblox = counts["objects"] * resolution * resolution * 16 * 5 if target in {"ROBLOX", "BOTH"} else 0
+    retained = retained_fields + graph_copies + retained_roblox
+    render_peak = max(passes, native_temps)
+    # Verified still-image capture retains source/copy arrays, packed bytes
+    # and independently decoded roundtrip buffers. The 8K float acceptance
+    # reached 10.31 GiB RSS; allow eight extra decoded buffers in addition to
+    # resident source/output images and the explicit fingerprint allocation.
+    image_capture_temps = fingerprint_bytes * 8
+    peak = max(render_peak, image_capture_temps)
+    geometry_capture = _positive_integer(stats.get("geometry_working_bytes", 0), "geometry_working_bytes")
+    fit_temps = _positive_integer(stats.get("fit_temporary_bytes", 0), "fit_temporary_bytes")
+    return {"ram_bytes": 512 * _MIB + counts["source_bytes"] * 2 + geometry * 3 + textures * 2 + peak + retained + fingerprint_bytes + geometry_capture + fit_temps,
+            "vram_bytes": 256 * _MIB + geometry * 2 + textures + render_peak + retained_fields + retained_roblox + geometry_capture + fit_temps,
             "source_stats": counts, "resolution": resolution,
+            "target": target, "retained_output_bytes": retained, "peak_temporary_bytes": peak,
+            "graph_copy_bytes": graph_copies, "native_field_bytes": retained_fields,
+            "geometry_capture_bytes": geometry_capture, "material_fit_temporary_bytes": fit_temps,
+            "fingerprint_temporary_bytes": fingerprint_bytes, "fingerprint_disk_bytes": fingerprint_disk,
+            "image_capture_temporary_bytes": image_capture_temps,
+            "fingerprint_disk_reserve_bytes": 64 * _MIB if fingerprint_disk else 0,
+            "fingerprint_basis": "one contiguous float32 extraction; large file-backed mapping may be fully resident in RAM",
+            "unknown_texture_tiles": counts["unknown_texture_tiles"],
+            "uncertainties": list(stats.get("texture_size_uncertainties", [])),
             "basis": "conservative planning heuristic; Blender/shader/backend overhead is scene-dependent"}
 
 
@@ -202,12 +305,22 @@ def admission(estimate, snapshot, *, device="CPU", device_id="", reserve_fractio
         # Invalid telemetry is unmeasured, never a successful comparison against NaN/inf or bool.
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
     reasons = []
+    if estimate.get("unknown_texture_tiles", 0):
+        reasons.append("Texture/UDIM tile dimensions are unmeasured; fallback memory estimate is not an upper bound")
     ram = snapshot.get("ram")
     available_ram = measured_bytes(ram.get("available_bytes") if isinstance(ram, dict) else None)
     if available_ram is None:
         reasons.append("RAM available memory is unmeasured")
     elif estimate["ram_bytes"] > available_ram * (1 - policy["reserve_fraction"]):
         reasons.append("estimated RAM exceeds available memory after reserve")
+    disk_bytes = estimate.get("fingerprint_disk_bytes", 0)
+    if disk_bytes:
+        temporary_disk = snapshot.get("temporary_disk")
+        free_disk = measured_bytes(temporary_disk.get("available_bytes") if isinstance(temporary_disk, dict) else None)
+        if free_disk is None:
+            reasons.append("temporary disk free space is unmeasured for live-image fingerprint")
+        elif disk_bytes + estimate.get("fingerprint_disk_reserve_bytes", 64 * _MIB) > free_disk:
+            reasons.append("live-image fingerprint exceeds temporary disk free space after reserve")
     selected = None
     if device.upper() == "GPU":
         devices = snapshot.get("gpus", [])
@@ -241,7 +354,9 @@ def evaluate_policy(resource_policy, engine_settings, source_stats=None):
         _positive_integer(value, "resolution")
         if not 4 <= value <= 8192:
             raise ValueError("resolution outside supported limits")
-    estimate = estimate_job(source_stats, resolution=max(resolutions))
+    estimate = estimate_job(source_stats, resolution=max(resolutions),
+                            target=settings.get("TARGET_PROFILE", "LEGACY"),
+                            quality_settings=settings.get("NATIVE_QUALITY"))
     for field, target in (("estimated_ram_bytes", "ram_bytes"), ("estimated_vram_bytes", "vram_bytes")):
         if field in policy:
             estimate[target] = max(estimate[target], policy[field])

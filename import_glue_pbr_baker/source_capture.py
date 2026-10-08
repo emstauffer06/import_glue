@@ -3,7 +3,7 @@
 Required still-image buffers are copied explicitly, packed on private IDs and
 round-tripped before saving. Original IDs are never saved/reloaded/packed. A
 capture is usable only after file verification and fresh-open verification.
-Dirty UDIM, multiview, and ambiguous sequence buffers fail closed; they are not
+Multiview and ambiguous sequence buffers fail closed; they are not
 silently replaced with on-disk images. Linked resources remain checksum-guarded
 external dependencies, which is stated in the manifest rather than called frozen.
 """
@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import struct
 import tempfile
 import time
 import uuid
@@ -20,7 +22,7 @@ import uuid
 import bpy
 import numpy as np
 
-from . import background_jobs, shader_graph
+from . import background_jobs, shader_graph, shader_resources, ocio_capture
 
 SCHEMA = 1
 MANIFEST_NAME = "source_capture.json"
@@ -214,7 +216,40 @@ def _geometry_guard(objects):
                        if not isinstance(dependency, (bpy.types.Material, bpy.types.ShaderNodeTree)))
 
 
-def _dependencies(objects):
+def _all_shader_dependencies(owner, visit=None):
+    """Traverse all saved output roots without editing active-output flags.
+
+    Native libraries retain engine-specific roots. Their resources must be
+    frozen before a worker opens the snapshot, even if Cycles never uses them.
+    """
+    tree = getattr(owner, "node_tree", None)
+    if tree is None:
+        return {"images": set(), "diagnostics": [], "node_count": 0}
+    primary = tree.get_output_node("CYCLES")
+    outputs = [node for node in tree.nodes if node.type in {"OUTPUT_MATERIAL", "OUTPUT_WORLD", "OUTPUT_LIGHT"}]
+    result = {"images": set(), "diagnostics": [], "node_count": 0}
+    class TreeProxy:
+        def __init__(self, output):
+            self.output = output
+        def get_output_node(self, _target):
+            return self.output
+        def __getattr__(self, key):
+            return getattr(tree, key)
+    class OwnerProxy:
+        def __init__(self, output):
+            self.node_tree = TreeProxy(output)
+        def __getattr__(self, key):
+            return getattr(owner, key)
+    for output in outputs:
+        current = shader_graph.material_dependencies(OwnerProxy(output), visit=visit)
+        result["images"].update(current["images"])
+        result["node_count"] += current["node_count"]
+        result["diagnostics"].extend(item for item in current["diagnostics"]
+                                     if output == primary or item["code"] != "CYCLES_UNSUPPORTED_NODE")
+    return result
+
+
+def _dependencies(objects, resources=None):
     """Live shader socket closure plus non-shader ID dependencies of selected geometry."""
     roots = list(objects)
     owners = list(shader_graph.used_materials(objects))
@@ -231,9 +266,15 @@ def _dependencies(objects):
             image = getattr(node, "image", None)
             if isinstance(image, bpy.types.Image):
                 nodes.setdefault(image.as_pointer(), []).append(node)
-            if node.bl_idname == "ShaderNodeScript" and getattr(node, "mode", "INTERNAL") == "EXTERNAL":
-                diagnostics.append("External OSL script dependency is not captured: " + node.name)
-        result = shader_graph.material_dependencies(owner, visit=visit)
+            if node.bl_idname in {"ShaderNodeScript", "ShaderNodeTexIES"} and getattr(node, "mode", "INTERNAL") == "EXTERNAL":
+                if resources is not None and node not in resources:
+                    resources.append(node)
+            elif node.bl_idname == "ShaderNodeScript":
+                try:
+                    shader_resources.validate_internal_node(node)
+                except shader_resources.ResourceError as exc:
+                    diagnostics.append(str(exc))
+        result = _all_shader_dependencies(owner, visit=visit)
         images.update(result["images"])
         diagnostics.extend(item["message"] for item in result["diagnostics"] if item["severity"] == "ERROR")
     # Follow geometry/modifier/constraint ID references, without reintroducing
@@ -274,23 +315,29 @@ def _environment(budget, dependencies):
     config_dir = Path(bpy.utils.system_resource("DATAFILES", path="colormanagement"))
     config = os.environ.get("OCIO", "")
     if config and Path(config).resolve() != (config_dir / "config.ocio").resolve():
-        # A config can reference arbitrary LUT paths; hashing only config.ocio
-        # would falsely claim its transforms are frozen.
-        raise CaptureError("Custom OCIO dependency closure is unverified; use the pinned Blender bundled configuration")
-    if not config_dir.is_dir() or not (config_dir / "config.ocio").is_file():
-        raise CaptureError("Bundled OCIO configuration could not be identified")
-    config_hash = hashlib.sha256()
-    for path in sorted(config_dir.rglob("*")):
-        if path.is_file():
-            register(path, "OCIO")
-            config_hash.update(path.relative_to(config_dir).as_posix().encode() + b"\0" + bytes.fromhex(dependencies[str(path.resolve())]["sha256"]))
+        try:
+            ocio = ocio_capture.inspect_config(config, register, budget.check)
+        except Exception as exc:
+            raise CaptureError("Custom OCIO closure could not be verified: " + str(exc)) from exc
+    else:
+        if not config_dir.is_dir() or not (config_dir / "config.ocio").is_file():
+            raise CaptureError("Bundled OCIO configuration could not be identified")
+        config_hash = hashlib.sha256()
+        for path in sorted(config_dir.rglob("*")):
+            if path.is_file():
+                register(path, "OCIO")
+                config_hash.update(path.relative_to(config_dir).as_posix().encode() + b"\0" + bytes.fromhex(dependencies[str(path.resolve())]["sha256"]))
+        ocio = {"kind": "BLENDER_BUNDLED", "config": str(config_dir / "config.ocio"), "sha256": config_hash.hexdigest()}
     for library in bpy.data.libraries:
         register(bpy.path.abspath(library.filepath), "LINKED_LIBRARY")
     return {"blender_version": list(bpy.app.version),
             "build_hash": bpy.app.build_hash.decode("utf-8", "replace"),
             "scene": scene.name, "frame": scene.frame_current, "subframe": scene.frame_subframe,
             "render_engine": scene.render.engine,
-            "ocio": {"kind": "BLENDER_BUNDLED", "config": str(config_dir / "config.ocio"), "sha256": config_hash.hexdigest()},
+            "ocio": ocio,
+            "cycles_shading_system": bool(getattr(scene.cycles, "shading_system", False)),
+            "working_space": bpy.data.colorspace.working_space,
+            "working_space_interop_id": bpy.data.colorspace.working_space_interop_id,
             "view": {key: getattr(scene.view_settings, key) for key in ("view_transform", "look", "exposure", "gamma")},
             "display_device": scene.display_settings.display_device,
             "sequencer_colorspace": scene.sequencer_colorspace_settings.name}, register
@@ -311,10 +358,12 @@ def _single_frame_path(image, nodes):
         private_user = tree.nodes.new("ShaderNodeTexImage").image_user
         for node in nodes:
             user = getattr(node, "image_user", None)
-            if user is None or user.frame_duration != 1 or user.use_cyclic or user.use_auto_refresh:
-                raise CaptureError("Sequence requires an explicit single-frame non-refreshing image-user configuration: " + image.name)
+            if user is None or user.frame_duration < 1:
+                raise CaptureError("Sequence requires an explicit positive-duration image-user configuration: " + image.name)
             relative_frame = int(bpy.context.scene.frame_current_final) - user.frame_start + 1
-            private_user.frame_current = min(max(relative_frame, 0), 1) + user.frame_offset
+            if user.use_cyclic:
+                relative_frame = relative_frame % user.frame_duration or user.frame_duration
+            private_user.frame_current = min(max(relative_frame, 0), user.frame_duration) + user.frame_offset
             paths.add(str(Path(image.filepath_from_user(image_user=private_user)).resolve()))
     finally:
         bpy.data.node_groups.remove(tree)
@@ -328,6 +377,143 @@ def _tiled_paths(image):
     if "<UDIM>" not in template:
         raise CaptureError("UDIM capture requires an explicit <UDIM> filepath template: " + image.name)
     return [(tile.number, Path(template.replace("<UDIM>", str(tile.number))).resolve()) for tile in image.tiles]
+
+
+def _exr_has_float_channels(path):
+    """Check the lossless-writer contract without depending on another decoder."""
+    with Path(path).open("rb") as stream:
+        if stream.read(4) != b"\x76\x2f\x31\x01":
+            return False
+        stream.read(4)
+        def string():
+            data = bytearray()
+            while len(data) <= 255:
+                value = stream.read(1)
+                if value == b"\0":
+                    return bytes(data)
+                if not value:
+                    raise CaptureError("Truncated EXR header")
+                data.extend(value)
+            raise CaptureError("Oversized EXR header string")
+        while True:
+            name = string()
+            if not name:
+                return False
+            kind = string()
+            size_bytes = stream.read(4)
+            if len(size_bytes) != 4:
+                raise CaptureError("Truncated EXR attribute")
+            size = struct.unpack("<I", size_bytes)[0]
+            if size > 1024 * 1024:
+                raise CaptureError("EXR attribute exceeds capture budget")
+            data = stream.read(size)
+            if name == b"channels" and kind == b"chlist":
+                position, count = 0, 0
+                while position < len(data) and data[position] != 0:
+                    position = data.index(b"\0", position) + 1
+                    if position + 16 > len(data) or struct.unpack_from("<i", data, position)[0] != 2:
+                        return False
+                    count += 1
+                    position += 16
+                return count >= 3
+
+
+def _decoded_tiles(image, tiles, temporary, budget=None):
+    """Decode each encoded packed tile using separate single-image datablocks."""
+    entries = list(image.packed_files)
+    if len(entries) != len(tiles):
+        raise CaptureError("Packed UDIM tile count differs")
+    result = []
+    for number in tiles:
+        # Every capture sets this explicit naming convention before packing.
+        matches = [entry for entry in entries if re.search(r"(?<!\d)%d(?!\d)" % number, Path(entry.filepath).name)]
+        if len(matches) != 1:
+            raise CaptureError("Packed UDIM tile cannot be mapped uniquely: " + str(number))
+        entry = matches[0]
+        path = Path(temporary) / ("decoded.%d" % number + Path(entry.filepath).suffix)
+        path.write_bytes(bytes(entry.packed_file.data))
+        decoded = bpy.data.images.load(str(path), check_existing=False)
+        try:
+            decoded.colorspace_settings.name = image.colorspace_settings.name
+            decoded.alpha_mode = image.alpha_mode
+            if budget is not None:
+                budget.image(decoded)
+            result.append({"tile": number, "size": list(decoded.size), "is_float": bool(decoded.is_float),
+                           "pixel_sha256": _pixel_hash(_pixels(decoded))})
+        finally:
+            bpy.data.images.remove(decoded)
+    return result
+
+
+def _private_udim(image, row, budget, created):
+    if "save_copy" not in bpy.types.Image.bl_rna.functions["save"].parameters:
+        raise CaptureError("UDIM buffer capture requires Blender's non-destructive save_copy API")
+    if image.file_format not in {"PNG", "OPEN_EXR"}:
+        raise CaptureError("UDIM buffer capture requires lossless PNG byte tiles or float32 EXR tiles")
+    if image.is_float != (image.file_format == "OPEN_EXR"):
+        raise CaptureError("UDIM buffer precision does not match a proven lossless PNG/float32 EXR encoding")
+    original = _image_state(image, pixels=True)
+    numbers = [tile.number for tile in image.tiles]
+    if len(numbers) > budget.limits["max_images"]:
+        raise CaptureError("UDIM tile count exceeds capture budget")
+    tile_pixels = 0
+    for tile in image.tiles:
+        width, height = tile.size
+        count = width * height
+        if width < 1 or height < 1 or count > budget.limits["max_image_pixels"]:
+            raise CaptureError("UDIM tile dimensions unavailable or exceed capture budget: " + str(tile.number))
+        tile_pixels += count
+    if budget.pixels + tile_pixels > budget.limits["max_total_pixels"]:
+        raise CaptureError("UDIM total pixel budget exceeded before native export")
+    # Explicit native save-copy walks the current per-tile ImBuf cache. Image.copy
+    # would instead discard dirty tiles. Only private paths receive encoded bytes.
+    with tempfile.TemporaryDirectory(prefix="import-glue-udim-") as temporary:
+        suffix = ".exr" if image.is_float else ".png"
+        template = Path(temporary) / ("capture.<UDIM>" + suffix)
+        budget.check()
+        image.save(filepath=str(template), save_copy=True)
+        if _image_state(image, pixels=True) != original:
+            raise CaptureError("Native UDIM save-copy changed original image state")
+        inventory = []
+        for number in numbers:
+            path = Path(str(template).replace("<UDIM>", str(number)))
+            if not path.is_file():
+                raise CaptureError("Native save-copy omitted UDIM tile " + str(number))
+            budget.file(path)
+            if image.is_float and not _exr_has_float_channels(path):
+                raise CaptureError("UDIM EXR writer did not preserve float32 channels")
+            if not image.is_float:
+                with path.open("rb") as stream:
+                    header = stream.read(26)
+                if header[:8] != b"\x89PNG\r\n\x1a\n" or header[24] != 8:
+                    raise CaptureError("UDIM PNG writer did not preserve byte channels")
+            inventory.append({"tile": number, "sha256": _sha(path)})
+        clone = bpy.data.images.load(str(template).replace("<UDIM>", str(numbers[0])), check_existing=False)
+        created.append(clone)
+        clone.name = "__IG_CAPTURE_" + uuid.uuid4().hex
+        clone.source = "TILED"
+        clone.filepath = str(template)
+        for number in numbers:
+            if number not in [tile.number for tile in clone.tiles]:
+                clone.tiles.new(number)
+        clone.colorspace_settings.name = image.colorspace_settings.name
+        clone.alpha_mode = image.alpha_mode
+        clone.use_half_precision = image.use_half_precision
+        clone.reload()
+        clone.pack()
+        tile_pixels = _decoded_tiles(clone, numbers, temporary, budget)
+        if tile_pixels[0]["pixel_sha256"] != original["pixel_sha256"]:
+            raise CaptureError("UDIM exposed tile pixels changed during lossless save-copy")
+        if sorted(entry["sha256"] for entry in _packed(clone)) != sorted(entry["sha256"] for entry in inventory):
+            raise CaptureError("UDIM packed bytes differ from private buffer exports")
+        if any(entry["is_float"] != image.is_float for entry in tile_pixels):
+            raise CaptureError("Mixed-precision UDIM tiles are not supported by the lossless writer contract")
+        row.update(mode="PACKED_UDIM_BUFFERS", captured_identity=_identity(clone),
+                   captured_state=_image_state(clone), decoded_tiles=tile_pixels,
+                   pixel_contract={"comparison": "fresh-decoded float32 hashes for every native save-copy tile",
+                                   "source_buffer_access": "Blender native all-tile writer; exposed first tile checked bitwise",
+                                   "encoding": "float32 EXR" if image.is_float else "PNG8"})
+    return clone
 
 
 def _private_image(image, nodes, row, budget, register, created):
@@ -350,7 +536,7 @@ def _private_image(image, nodes, row, budget, register, created):
         return None
     if image.source == "TILED":
         if image.is_dirty:
-            raise CaptureError("Dirty UDIM cannot be captured: Python does not expose verified per-tile pixel buffers")
+            return _private_udim(image, row, budget, created)
         clone = image.copy()
         created.append(clone)
         clone.name = "__IG_CAPTURE_" + uuid.uuid4().hex
@@ -369,12 +555,14 @@ def _private_image(image, nodes, row, budget, register, created):
         if packed_hashes != expected:
             raise CaptureError("UDIM packed-file bytes do not match the captured tile inventory")
         row.update(mode="PACKED_UDIM", captured_identity=_identity(clone), captured_state=_image_state(clone))
+        with tempfile.TemporaryDirectory(prefix="import-glue-udim-proof-") as temporary:
+            row["decoded_tiles"] = _decoded_tiles(clone, [tile.number for tile in clone.tiles], temporary, budget)
         return clone
     source = image
     if image.source == "SEQUENCE":
         path = _single_frame_path(image, nodes)
         budget.file(path)
-        row["sequence_frame"] = {"path": str(path), "sha256": _sha(path), "policy": "explicit one-frame image users"}
+        row["sequence_frame"] = {"path": str(path), "sha256": _sha(path), "policy": "resolved static scene frame; all live users agree"}
         source = bpy.data.images.load(str(path), check_existing=False)
         created.append(source)
         source.colorspace_settings.name = image.colorspace_settings.name
@@ -464,12 +652,78 @@ def capture_image_copy(image, image_nodes=None, *, limits=None):
                     bpy.data.images.remove(temporary)
 
 
+def _resource_state(node):
+    keys = ["mode", "filepath"] + (["script", "bytecode", "bytecode_hash", "use_auto_update"]
+                                   if node.bl_idname == "ShaderNodeScript" else ["ies"])
+    return {key: getattr(node, key) for key in keys}
+
+
+def _shader_trees():
+    trees = list(bpy.data.node_groups)
+    for owner in [*bpy.data.materials, *bpy.data.worlds, *bpy.data.lights]:
+        tree = getattr(owner, "node_tree", None)
+        if tree is not None:
+            trees.append(tree)
+    return trees
+
+
+def _shader_tree_identity(tree):
+    for kind, owners in (("MATERIAL", bpy.data.materials), ("WORLD", bpy.data.worlds), ("LIGHT", bpy.data.lights)):
+        for owner in owners:
+            if getattr(owner, "node_tree", None) == tree:
+                return {"kind": kind, "owner": _identity(owner)}
+    return {"kind": "NODE_GROUP", "owner": _identity(tree)}
+
+
+def _copy_resource_owners(objects, resources, remaps, groups):
+    """Keep mode changes on private owner graphs: restoring an EXTERNAL OSL
+    node itself can trigger Blender to rewrite its source .oso sidecar.
+    """
+    required = {node.as_pointer() for node in resources}
+    owners = list(shader_graph.used_materials(objects))
+    if bpy.context.scene.world:
+        owners.append(bpy.context.scene.world)
+    owners.extend(obj.data for obj in bpy.context.scene.objects if obj.type == "LIGHT")
+    visited_owners = set()
+    for owner in owners:
+        if owner.as_pointer() in visited_owners or getattr(owner, "node_tree", None) is None:
+            continue
+        visited_owners.add(owner.as_pointer())
+        found = []
+        _all_shader_dependencies(owner, visit=lambda node, _socket, _context:
+                                 found.append(node) if node.as_pointer() in required else None)
+        if not found:
+            continue
+        clone = owner.copy()
+        clone.name = "__IG_CAPTURE_OWNER_" + uuid.uuid4().hex
+        clone.use_fake_user = False
+        # Register ownership before touching a private graph for exception cleanup.
+        remaps.append((owner, clone, bool(owner.use_fake_user)))
+        pending = [(clone.node_tree, frozenset())]
+        while pending:
+            tree, ancestors = pending.pop()
+            for node in tree.nodes:
+                child = getattr(node, "node_tree", None)
+                if child is None:
+                    continue
+                pointer = child.as_pointer()
+                if pointer in ancestors:
+                    raise CaptureError("Recursive shader group cannot be captured")
+                private = child.copy()
+                private.name = "__IG_CAPTURE_GROUP_" + uuid.uuid4().hex
+                private.use_fake_user = False
+                groups.append(private)
+                node.node_tree = private
+                pending.append((private, ancestors | {pointer}))
+        owner.user_remap(clone)
+
+
 def capture_snapshot(path, objects=None, *, limits=None):
     """Save a private snapshot and return its manifest; original state is restored.
 
     objects defaults to selected mesh objects. Required shader images, active
     world/light images and selected geometry ID resources form the capture scope.
-    Image sequences are accepted only for explicit, unambiguous one-frame users.
+    Image sequences freeze the scene frame when all live users resolve identically.
     """
     global _BUSY
     if _BUSY:
@@ -478,6 +732,7 @@ def capture_snapshot(path, objects=None, *, limits=None):
     directory = None
     manifest = None
     created, remapped, original_images = [], [], []
+    resource_texts, resource_owners, resource_groups = [], [], []
     temporary = None
     error = None
     try:
@@ -502,13 +757,20 @@ def capture_snapshot(path, objects=None, *, limits=None):
         manifest = {"schema": SCHEMA, "capture_id": uuid.uuid4().hex, "status": "CAPTURING",
                     "snapshot": str(destination), "source": str(Path(original_file).resolve()),
                     "source_sha256": source_hash, "objects": [_identity(obj) for obj in objects],
-                    "images": [], "dependencies": [], "diagnostics": [],
-                    "limits": budget.limits, "resource_policy": "Images embedded; linked libraries and bundled OCIO retained externally under checksums"}
+                    "images": [], "shader_resources": [], "dependencies": [], "diagnostics": [],
+                    "limits": budget.limits, "resource_policy": "Images and static shader files embedded; linked libraries and OCIO retained externally under checksums"}
         dependencies = {}
         manifest["environment"], register = _environment(budget, dependencies)
-        images, nodes, diagnostics = _dependencies(objects)
+        resource_nodes = []
+        images, nodes, diagnostics = _dependencies(objects, resource_nodes)
         if diagnostics:
             raise CaptureError("Required source dependencies are unverified: " + "; ".join(diagnostics))
+        if resource_nodes:
+            _copy_resource_owners(objects, resource_nodes, resource_owners, resource_groups)
+            resource_nodes = []
+            images, nodes, diagnostics = _dependencies(objects, resource_nodes)
+            if diagnostics:
+                raise CaptureError("Private shader dependency closure is unverified: " + "; ".join(diagnostics))
         for image in images:
             if image.source == "MOVIE":
                 raise CaptureError("Video textures are outside this static-material capture: " + image.name)
@@ -519,6 +781,16 @@ def capture_snapshot(path, objects=None, *, limits=None):
                 budget.image(image)
         original_images = [(image, _image_state(image, pixels=image.source in {"FILE", "GENERATED"}) if image in images else _basic_image_state(image))
                            for image in list(bpy.data.images)]
+        for node in resource_nodes:
+            budget.check()
+            prepared = shader_resources.prepare_node(node)
+            for entry in prepared["dependencies"]:
+                budget.file(Path(entry["path"]))
+                if _sha(entry["path"]) != entry["sha256"]:
+                    raise CaptureError("Shader dependency changed during capture: " + entry["path"])
+            record = shader_resources.capture_node(node, resource_texts, prepared=prepared)
+            record.update(node=node.name, tree=_shader_tree_identity(node.id_data))
+            manifest["shader_resources"].append(record)
         for image in images:
             budget.check()
             row = {"source_identity": _identity(image), "source_state": _image_state(image), "external_tiles": []}
@@ -537,6 +809,10 @@ def capture_snapshot(path, objects=None, *, limits=None):
         for dependency in manifest["dependencies"]:
             if _sha(dependency["path"]) != dependency["sha256"]:
                 raise CaptureError("Source dependency changed during capture: " + dependency["path"])
+        for resource in manifest["shader_resources"]:
+            for dependency in resource["dependencies"]:
+                if _sha(dependency["path"]) != dependency["sha256"]:
+                    raise CaptureError("Shader dependency changed during capture: " + dependency["path"])
         temporary = destination.with_name(".capture-" + uuid.uuid4().hex + ".blend")
         if bpy.ops.wm.save_as_mainfile(filepath=str(temporary), copy=True, relative_remap=True) != {"FINISHED"}:
             raise CaptureError("Blender did not save the source snapshot")
@@ -553,6 +829,25 @@ def capture_snapshot(path, objects=None, *, limits=None):
         error = exc
     finally:
         restore_errors = []
+        for original, clone, fake_user in reversed(resource_owners):
+            try:
+                clone.user_remap(original)
+                original.use_fake_user = fake_user
+                collection = (bpy.data.materials if isinstance(clone, bpy.types.Material) else
+                              bpy.data.worlds if isinstance(clone, bpy.types.World) else bpy.data.lights)
+                collection.remove(clone)
+            except Exception as exc:
+                restore_errors.append("Shader owner restoration: " + str(exc))
+        for group in reversed(resource_groups):
+            try:
+                bpy.data.node_groups.remove(group)
+            except Exception as exc:
+                restore_errors.append("Shader group cleanup: " + str(exc))
+        for text in reversed(resource_texts):
+            try:
+                bpy.data.texts.remove(text)
+            except Exception as exc:
+                restore_errors.append("Shader text cleanup: " + str(exc))
         for original, clone in reversed(remapped):
             try:
                 clone.user_remap(original)
@@ -617,8 +912,14 @@ def verify_snapshot(manifest_or_path, *, require_build=True, snapshot_path=None)
         raise CaptureError("Fresh-open verification must run inside the captured .blend")
     environment = manifest["environment"]
     ocio_environment = os.environ.get("OCIO", "")
-    if ocio_environment and Path(ocio_environment).resolve() != Path(environment["ocio"]["config"]).resolve():
-        raise CaptureError("Worker OCIO environment differs from bundled captured configuration")
+    if ((environment["ocio"]["kind"] == "CUSTOM_OCIO" and not ocio_environment) or
+            (ocio_environment and Path(ocio_environment).resolve() != Path(environment["ocio"]["config"]).resolve())):
+        raise CaptureError("Worker OCIO environment differs from captured configuration")
+    if environment["ocio"]["kind"] == "CUSTOM_OCIO":
+        dependencies = {}
+        actual_environment, _register = _environment(_Budget(manifest.get("limits")), dependencies)
+        if actual_environment["ocio"] != environment["ocio"]:
+            raise CaptureError("Worker custom OCIO transform closure differs from captured configuration")
     if require_build and (list(bpy.app.version) != environment["blender_version"] or
                           bpy.app.build_hash.decode("utf-8", "replace") != environment["build_hash"]):
         raise CaptureError("Blender build differs from the captured renderer")
@@ -627,6 +928,13 @@ def verify_snapshot(manifest_or_path, *, require_build=True, snapshot_path=None)
         raise CaptureError("Captured scene/frame/subframe changed")
     if scene.render.engine != environment["render_engine"]:
         raise CaptureError("Captured renderer changed")
+    if ("working_space" in environment and
+            (bpy.data.colorspace.working_space != environment["working_space"] or
+             bpy.data.colorspace.working_space_interop_id != environment["working_space_interop_id"])):
+        raise CaptureError("Captured blend-file working color space changed")
+    if ("cycles_shading_system" in environment and
+            bool(scene.cycles.shading_system) != environment["cycles_shading_system"]):
+        raise CaptureError("Captured Cycles shading system changed")
     if ({key: getattr(scene.view_settings, key) for key in environment["view"]} != environment["view"] or
             scene.display_settings.display_device != environment["display_device"] or
             scene.sequencer_colorspace_settings.name != environment["sequencer_colorspace"]):
@@ -662,5 +970,16 @@ def verify_snapshot(manifest_or_path, *, require_build=True, snapshot_path=None)
             raise CaptureError("Captured packed image bytes changed: " + image.name)
         if "pixel_sha256" in expected and _pixel_hash(_pixels(image)) != expected["pixel_sha256"]:
             raise CaptureError("Captured image pixels differ after fresh open: " + image.name)
+        if "decoded_tiles" in row:
+            with tempfile.TemporaryDirectory(prefix="import-glue-udim-verify-") as temporary:
+                actual = _decoded_tiles(image, [entry["tile"] for entry in row["decoded_tiles"]], temporary)
+            if actual != row["decoded_tiles"]:
+                raise CaptureError("Captured UDIM tile pixels differ after fresh open: " + image.name)
+    for record in manifest.get("shader_resources", []):
+        trees = [tree for tree in _shader_trees() if _shader_tree_identity(tree) == record["tree"]]
+        if len(trees) != 1 or trees[0].nodes.get(record["node"]) is None:
+            raise CaptureError("Captured shader resource identity is unavailable or ambiguous")
+        shader_resources.verify_node(trees[0].nodes[record["node"]], record)
     return {"ok": True, "capture_id": manifest["capture_id"], "stage": "FRESH_OPEN_VERIFIED",
-            "images_verified": len(manifest["images"]), "pixel_contract": "bitwise float32 for captured single-image buffers"}
+            "images_verified": len(manifest["images"]), "shader_resources_verified": len(manifest.get("shader_resources", [])),
+            "pixel_contract": "bitwise float32 decoded buffers, including every captured UDIM tile"}

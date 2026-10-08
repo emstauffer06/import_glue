@@ -292,6 +292,10 @@ ALLOW_APPROXIMATION = False
 CAPABILITY_PROFILE = "PBR_BASE"       # material_capabilities output profile
 OUTPUT_PROFILE = "PBR_BASE"           # PBR_BASE (8-bit) | PBR_HIGH_PRECISION (PNG16)
 TARGET_PROFILE = "LEGACY"            # LEGACY | BLENDER_NATIVE | ROBLOX | BOTH
+ROBLOX_MATERIAL_FIT = False           # measured approximation; requires ALLOW_APPROXIMATION
+ROBLOX_FIT_SETTINGS = {}              # bounded rendered fit overrides
+ROBLOX_GEOMETRY = False              # capture supported static displacement on a private mesh
+ROBLOX_GEOMETRY_SETTINGS = {}         # bounded subdivision/triangle settings
 ROBLOX_TEXTURE_LIMIT = 1024           # Configurable delivery preset, not an engine maximum.
 _TARGET_PIPELINE_ACTIVE = False
 PACK_MRA_GRAPH_BAKE = True             # equivalent metal/rough/opacity in one pass
@@ -608,7 +612,8 @@ _T0                = time.time()
 # V3.3/V3.3b and V3.4 flags are folded into this same block, each marked.
 # ==========================================================================
 TOOL_NAME             = "import_glue"
-TOOL_VERSION          = "4.0"  # v4.0: verified source capture and explicit native/Roblox targets.
+TOOL_VERSION          = "4.2"  # v4.2: rendered material fitting, static geometry and large-image capture.
+NATIVE_QUALITY        = {}     # explicit overrides of native_quality.DEFAULTS; never changes source graphs.
                               #       durable completed-part checkpoints, optional visual
                               #       comparison reports, INT16_2D/FLOAT4 attribute fingerprints
                               # v3.7: required graph/UV gates, packed scalar parity, CPU recovery,
@@ -5945,33 +5950,96 @@ def _packed_content_digest(packed: Any) -> Tuple[int, str]:
     return int(getattr(packed, "size", len(data))), hashlib.sha256(data).hexdigest()
 
 
+_LIVE_IMAGE_HEAP_LIMIT = 256 * 1024 * 1024
+_LIVE_IMAGE_HASH_BLOCK = 4 * 1024 * 1024
+
+
+def _hash_live_pixel_buffer(pixels: Any) -> str:
+    """Hash raw float32 bytes without copying, checking cancellation per block."""
+    digest = hashlib.sha256()
+    view = memoryview(pixels).cast("B")
+    try:
+        for start in range(0, len(view), _LIVE_IMAGE_HASH_BLOCK):
+            if _RUN_CONTROL is not None:
+                _RUN_CONTROL.check_cancel()
+            block = view[start:start + _LIVE_IMAGE_HASH_BLOCK]
+            try:
+                digest.update(block)
+            finally:
+                block.release()
+    finally:
+        view.release()
+    return digest.hexdigest()
+
+
+def _reserve_fingerprint_file(handle: Any, byte_count: int) -> None:
+    """Reserve backing storage before Blender writes into a memory mapping."""
+    if hasattr(os, "posix_fallocate"):
+        try:
+            os.posix_fallocate(handle.fileno(), 0, byte_count)
+            return
+        except OSError as exc:
+            # Some filesystems do not implement fallocate. Disk-full/quota and
+            # other errors must propagate rather than leave a sparse mapping.
+            import errno
+            if exc.errno not in {errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL}:
+                raise
+    block = bytes(min(byte_count, _LIVE_IMAGE_HASH_BLOCK))
+    remaining = byte_count
+    while remaining:
+        if _RUN_CONTROL is not None:
+            _RUN_CONTROL.check_cancel()
+        count = min(remaining, len(block))
+        if handle.write(block[:count]) != count:
+            raise OSError("Incomplete live-image fingerprint backing-file allocation")
+        remaining -= count
+    handle.flush()
+
+
 def _live_image_pixel_digest(image: Any, width: int, height: int) -> str:
-    """Hash the decoded pixels that IMAGE SourceRefs actually sample."""
-    float_count = max(0, width * height * 4)
+    """Hash exact live float32 pixels; large extraction uses a temporary file.
+
+    Blender exposes only contiguous foreach_get, not partial reads. RNA slices
+    repeatedly allocate/read the complete image, so they are not streaming.
+    A large mapping avoids another anonymous NumPy allocation but can still add
+    the full image size to peak RSS. Resource admission explicitly counts it.
+    """
+    import mmap
+    import tempfile
+
+    float_count = width * height * 4
     byte_count = float_count * np.dtype(np.float32).itemsize
-    max_bytes = 256 * 1024 * 1024  # one 4K RGBA float buffer; 8K safely disables resume
-    if byte_count > max_bytes:
-        raise RuntimeError(
-            "image %s needs %.1f MiB for an exact live-pixel fingerprint; "
-            "resume is disabled above %.0f MiB"
-            % (
-                datablock_name(image, "<image>"), byte_count / (1024.0 * 1024.0),
-                max_bytes / (1024.0 * 1024.0),
-            )
-        )
-    cacheable = (
-        not bool(getattr(image, "is_dirty", False))
-        and getattr(image, "source", "") != "GENERATED"
-    )
-    cache_key = (int(image.as_pointer()), width, height)
-    if cacheable and cache_key in _LIVE_IMAGE_DIGEST_CACHE:
-        return _LIVE_IMAGE_DIGEST_CACHE[cache_key]
-    pixels = np.empty(float_count, dtype=np.float32)
-    if float_count:
-        image.pixels.foreach_get(pixels)
-    digest = hashlib.sha256(memoryview(pixels).cast("B")).hexdigest()
-    if cacheable:
-        _LIVE_IMAGE_DIGEST_CACHE[cache_key] = digest
+    if width < 0 or height < 0 or tuple(image.size) != (width, height) or len(image.pixels) != float_count:
+        raise RuntimeError("Image dimensions/buffer disagree during live-pixel fingerprint: " + datablock_name(image, "<image>"))
+    _run_boundary("source-image-fingerprint", image=datablock_name(image, "<image>"),
+                  bytes=byte_count, storage="memory" if byte_count <= _LIVE_IMAGE_HEAP_LIMIT else "temporary-file")
+    # Re-read every time: a clean FILE image can be reloaded in place without
+    # changing its pointer or dimensions. Pointer-only caching would miss it.
+    if byte_count <= _LIVE_IMAGE_HEAP_LIMIT:
+        pixels = np.empty(float_count, dtype=np.float32)
+        if float_count:
+            image.pixels.foreach_get(pixels)
+        digest = _hash_live_pixel_buffer(pixels)
+    else:
+        directory = tempfile.gettempdir()
+        if shutil.disk_usage(directory).free < byte_count + 64 * 1024 * 1024:
+            raise RuntimeError("Insufficient temporary disk space for live-image fingerprint (needs %.1f MiB plus 64 MiB reserve): %s" %
+                               (byte_count / (1024.0 ** 2), datablock_name(image, "<image>")))
+        with tempfile.TemporaryFile(prefix="import-glue-fingerprint-", dir=directory) as backing:
+            _reserve_fingerprint_file(backing, byte_count)
+            if _RUN_CONTROL is not None:
+                _RUN_CONTROL.check_cancel()
+            with mmap.mmap(backing.fileno(), byte_count, access=mmap.ACCESS_WRITE) as mapping:
+                pixels = np.ndarray((float_count,), dtype=np.float32, buffer=mapping)
+                try:
+                    image.pixels.foreach_get(pixels)
+                    digest = _hash_live_pixel_buffer(pixels)
+                finally:
+                    # Drop the exported NumPy buffer before closing the mmap,
+                    # including on cancellation/errors (required on Windows).
+                    del pixels
+    if tuple(image.size) != (width, height) or len(image.pixels) != float_count:
+        raise RuntimeError("Image buffer changed during live-pixel fingerprint: " + datablock_name(image, "<image>"))
     return digest
 
 
@@ -6480,6 +6548,8 @@ def config_fingerprint() -> str:
         "output_profile": output_contract.build_output_contract(OUTPUT_PROFILE)["profile"],
         "target_profile": TARGET_PROFILE,
         "roblox_texture_limit": ROBLOX_TEXTURE_LIMIT,
+        "roblox_fit": [ROBLOX_MATERIAL_FIT, ROBLOX_FIT_SETTINGS],
+        "roblox_geometry": [ROBLOX_GEOMETRY, ROBLOX_GEOMETRY_SETTINGS],
         "resolution": {
             "min": MIN_RES, "bake": RES, "max": MAX_RES,
             "density_min": DENSITY_MIN_RES, "mode": RES_MODE,

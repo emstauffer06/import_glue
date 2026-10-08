@@ -1,13 +1,13 @@
 schema_version = "1.0.0"
 
 id = "import_glue_pbr_baker"
-version = "1.6.0"
+version = "1.8.0"
 name = "Import Glue PBR Baker"
 tagline = "Bake game-rip materials into Roblox-ready PBR maps"
 maintainer = "Sohra"
 type = "add-on"
 
-blender_version_min = "4.3.0"
+blender_version_min = "5.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]

@@ -30,7 +30,8 @@ ENGINE_KEYS = frozenset({
     "EXPORT_FBX", "AUTO_UNWRAP_NO_UV", "DONE_LIST", "DURABLE_CHECKPOINTS", "TRI_BUDGET",
     "ENFORCE_TRI_BUDGET", "CROP_SPLIT_PREPASS", "FINALIZE_IN_SESSION", "VISUAL_VALIDATION",
     "VISUAL_VALIDATION_GATE", "VISUAL_VALIDATION_SETTINGS",
-    "GPU_DEVICE_ID", "OUTPUT_PROFILE", "TARGET_PROFILE", "ROBLOX_TEXTURE_LIMIT",
+    "GPU_DEVICE_ID", "OUTPUT_PROFILE", "TARGET_PROFILE", "ROBLOX_TEXTURE_LIMIT", "NATIVE_QUALITY",
+    "ROBLOX_MATERIAL_FIT", "ROBLOX_FIT_SETTINGS", "ROBLOX_GEOMETRY", "ROBLOX_GEOMETRY_SETTINGS",
 })
 PRECHECK_KEYS = frozenset({"enabled", "pool", "repair", "repair_into_staging", "repair_mode",
                           "allow_missing", "allow_corrupt", "strict_absolute"})
@@ -147,7 +148,7 @@ def _mapping(value, allowed, label):
 def _settings(value, source):
     settings = _mapping(value, ENGINE_KEYS, "engine setting")
     for key in ENGINE_KEYS - {"OUTPUT_ROOT", "RES", "MAX_RES", "BAKE_DENSITY_SCALE", "DEVICE",
-                              "SOURCE_DIRS", "ROUTE_MODE", "TRI_BUDGET", "VISUAL_VALIDATION_SETTINGS", "GPU_DEVICE_ID", "OUTPUT_PROFILE", "TARGET_PROFILE", "ROBLOX_TEXTURE_LIMIT"}:
+                              "SOURCE_DIRS", "ROUTE_MODE", "TRI_BUDGET", "VISUAL_VALIDATION_SETTINGS", "GPU_DEVICE_ID", "OUTPUT_PROFILE", "TARGET_PROFILE", "ROBLOX_TEXTURE_LIMIT", "NATIVE_QUALITY", "ROBLOX_FIT_SETTINGS", "ROBLOX_GEOMETRY_SETTINGS"}:
         if key in settings and type(settings[key]) is not bool:
             raise JobError(key + " must be a boolean")
     for key in ("RES", "MAX_RES"):
@@ -178,6 +179,13 @@ def _settings(value, source):
         raise JobError("SOURCE_DIRS must contain absolute paths")
     if "VISUAL_VALIDATION_SETTINGS" in settings and settings["VISUAL_VALIDATION_SETTINGS"] is not None and type(settings["VISUAL_VALIDATION_SETTINGS"]) is not dict:
         raise JobError("VISUAL_VALIDATION_SETTINGS must be JSON object or null")
+    if "NATIVE_QUALITY" in settings and settings["NATIVE_QUALITY"] is not None and type(settings["NATIVE_QUALITY"]) is not dict:
+        raise JobError("NATIVE_QUALITY must be JSON object or null")
+    for name in ("ROBLOX_FIT_SETTINGS", "ROBLOX_GEOMETRY_SETTINGS"):
+        if name in settings and type(settings[name]) is not dict:
+            raise JobError(name + " must be a JSON object")
+    if (settings.get("ROBLOX_MATERIAL_FIT") or settings.get("ROBLOX_GEOMETRY")) and not settings.get("ALLOW_APPROXIMATION", False):
+        raise JobError("Roblox fitting/geometry conversion requires explicit ALLOW_APPROXIMATION")
     output = settings.get("OUTPUT_ROOT") or str(Path(source).parent)
     if type(output) is not str or not os.path.isabs(output): raise JobError("OUTPUT_ROOT must be absolute")
     settings["OUTPUT_ROOT"] = str(Path(output).resolve())
@@ -532,8 +540,28 @@ def read_log_tail(job_dir, max_bytes=16384):
         return handle.read(count).decode("utf-8", "replace")
 
 
-def load_result(job_dir):
+def load_result(job_dir, *, allow_partial=False):
     status = poll(job_dir)
+    if allow_partial and status["state"] in {"FAILED", "CANCELLED"} and not status["process_alive"]:
+        result = read_json(_inside(job_dir, "partial_result.json"))
+        spec = load_job(job_dir)
+        if (result.get("schema") != SCHEMA or result.get("job_id") != Path(job_dir).name
+                or result.get("state") != "PARTIAL" or result.get("target") != "BLENDER_NATIVE"
+                or result.get("snapshot_sha256") != spec["snapshot_sha256"]
+                or result.get("engine_sha256") != spec["engine_sha256"]):
+            raise JobError("Partial result identity/status mismatch")
+        names = result.get("output_objects")
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names):
+            raise JobError("Partial result has no validated object list")
+        path = Path(result["result_path"])
+        if path.is_symlink() or not path.resolve().is_relative_to(Path(spec["engine_settings"]["OUTPUT_ROOT"]).resolve()):
+            raise JobError("Partial result is outside its output root")
+        if sha256_file(path) != result.get("result_sha256"):
+            raise JobError("Partial native library checksum mismatch")
+        if sha256_file(result["manifest"]) != result.get("manifest_sha256"):
+            raise JobError("Partial result manifest checksum mismatch")
+        verify_dependencies({"dependencies": result.get("output_dependencies", [])})
+        return result
     if status["state"] != "SUCCEEDED" or status["process_alive"]:
         raise JobError("Only an exited, successful worker result can be loaded")
     result = read_json(_inside(job_dir, "result.json"))

@@ -48,7 +48,8 @@ class WorkerControl:
                     except OSError: pass  # Main-thread emit/terminal write remains authoritative and fails closed.
 
     def emit(self, event):
-        allowed = {"kind", "stage", "object", "route", "semantic", "completed", "total", "checkpoint", "reason", "message"}
+        allowed = {"kind", "stage", "target", "object", "route", "semantic", "field", "resolution",
+                   "current", "completed", "total", "checkpoint", "reason", "message"}
         safe = {}
         for key, value in event.items():
             if key not in allowed: continue
@@ -142,6 +143,8 @@ def _resource_decision(engine, resources, policy, stats):
     # A sealed spec may override only a subset of engine settings. Admission
     # must describe the effective workload, including untouched engine defaults.
     effective = {key: getattr(engine, key) for key in ("RES", "MAX_RES", "DEVICE", "GPU_DEVICE_ID")}
+    effective["TARGET_PROFILE"] = getattr(engine, "TARGET_PROFILE", "LEGACY")
+    effective["NATIVE_QUALITY"] = getattr(engine, "NATIVE_QUALITY", None)
     return resources.evaluate_policy(policy, effective, stats)
 
 
@@ -177,7 +180,10 @@ def run(job_dir):
         control.check_cancel()
 
         resources = importlib.import_module(package_name + ".resources")
-        stats = resources.source_statistics(targets, bpy.data.images, str(directory / spec["snapshot"]))
+        preflight = importlib.import_module(package_name + ".preflight")
+        explanation = preflight.analyze(targets)
+        jobs.atomic_json(directory / "preflight.json", explanation)
+        stats = explanation["source_stats"]
         decision = _resource_decision(engine, resources, spec["resource_policy"], stats)
         decision = jobs._json_copy(decision)
         if type(decision) is not dict or type(decision.get("allowed")) is not bool:
@@ -215,13 +221,47 @@ def run(job_dir):
                                                    for path, digest in sorted(runtime_inputs.items())]}
         jobs.atomic_json(directory / "runtime_dependencies.json", runtime_dependencies)
         control.emit({"kind": "stage", "stage": "engine"})
-        census = engine.main(args_override=spec["engine_args"], run_control=control)
+        args = dict(spec["engine_args"])
+        # This private argument is made only after sealed snapshot, capture and
+        # external dependency verification. Resume copies the snapshot unchanged.
+        capture_identity = None
+        if spec.get("source_capture"):
+            captured = jobs._read_capture_manifest(capture_path)
+            capture_identity = {name: captured.get(name) for name in
+                                ("capture_id", "snapshot_sha256", "images", "environment", "dependencies")}
+        args["_checkpoint_source"] = {
+            "snapshot_sha256": spec["snapshot_sha256"], "source_capture": capture_identity,
+            "objects": spec["objects"], "dependencies": spec["dependencies"],
+            "runtime_dependencies": runtime_dependencies["dependencies"]}
+        census = engine.main(args_override=args, run_control=control)
         if not isinstance(census, dict): raise RuntimeError("Engine returned no failure census")
         if census.get("cancelled") or census.get("exit_code") == 130:
             terminal = {"state": "CANCELLED", "reason": "Cooperative cancellation; completed checkpoints retained", "census": census}
             exit_code = 130
             return exit_code
         if type(census.get("exit_code")) is not int or census["exit_code"] != 0:
+            # Successful native output has a separately saved library even when
+            # the Roblox target fails. Seal it only after rechecking inputs.
+            native = census.get("target_results", {}).get("BLENDER_NATIVE", {})
+            library = native.get("blend_library") or {}
+            if native.get("exit_code") == 0 and library.get("objects") and library.get("path"):
+                jobs.verify_dependencies(spec)
+                jobs.verify_dependencies(runtime_dependencies)
+                if capture is not None:
+                    capture.verify_capture_files(capture_path, snapshot_path=directory / spec["snapshot"])
+                path = Path(library["path"]).resolve()
+                if not path.is_relative_to(Path(engine.OUTPUT_ROOT).resolve()):
+                    raise RuntimeError("Partial native library is outside the output root")
+                if jobs.sha256_file(path) != library["sha256"]:
+                    raise RuntimeError("Partial native library changed before sealing")
+                outputs = [bpy.data.objects[name] for name in library["objects"]]
+                partial = {"schema": jobs.SCHEMA, "job_id": spec["job_id"], "state": "PARTIAL",
+                           "target": "BLENDER_NATIVE", "result_path": str(path),
+                           "result_sha256": library["sha256"], "output_objects": library["objects"],
+                           "snapshot_sha256": spec["snapshot_sha256"], "engine_sha256": spec["engine_sha256"],
+                           "manifest": census["manifest"], "manifest_sha256": jobs.sha256_file(census["manifest"]),
+                           "output_dependencies": _output_dependencies(bpy, outputs, jobs)}
+                jobs.atomic_json(directory / "partial_result.json", partial)
             terminal = {"state": "FAILED", "reason": "Engine census reports incomplete or failed outputs", "census": census}
             exit_code = 1
             return exit_code
@@ -249,7 +289,8 @@ def run(job_dir):
         if result["manifest"]:
             result["manifest_sha256"] = jobs.sha256_file(result["manifest"])
         jobs.atomic_json(directory / "result.json", result)
-        terminal = {"state": "SUCCEEDED", "reason": "Clean census and separate result blend saved", "manifest": result["manifest"]}
+        terminal = {"state": "SUCCEEDED", "reason": "Clean census and separate result blend saved",
+                    "manifest": result["manifest"], "census": census}
         exit_code = 0
         return exit_code
     except BaseException as exc:

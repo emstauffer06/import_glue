@@ -20,7 +20,8 @@ KNOWN_FLAGS = frozenset({
     "output-root", "allow-approximation",
     "visual-validation", "visual-gate", "visual-settings",
     "gpu-device", "output-profile", "resource-enforce", "resource-reserve",
-    "target", "roblox-texture-limit",
+    "target", "roblox-texture-limit", "native-settings", "preflight-only",
+    "roblox-fit", "fit-settings", "roblox-geometry", "geometry-settings",
 })
 
 
@@ -297,6 +298,51 @@ def main() -> None:
                ", ".join("--" + name for name in sorted(KNOWN_FLAGS)))
         )
     _apply_runtime_flags(args)
+    for flag, config_flag, enabled_key, settings_key, module_name in (
+        ("roblox-fit", "fit-settings", "ROBLOX_MATERIAL_FIT", "ROBLOX_FIT_SETTINGS", "material_fit"),
+        ("roblox-geometry", "geometry-settings", "ROBLOX_GEOMETRY", "ROBLOX_GEOMETRY_SETTINGS", "geometry_delivery"),
+    ):
+        if config_flag in args and flag not in args:
+            raise _setup_error("--%s requires --%s" % (config_flag, flag))
+        if flag not in args:
+            continue
+        if args[flag] is not True:
+            raise _setup_error("--%s takes no value" % flag)
+        if engine.TARGET_PROFILE not in {"ROBLOX", "BOTH"} or not engine.ALLOW_APPROXIMATION:
+            raise _setup_error("--%s requires --target ROBLOX/BOTH and --allow-approximation" % flag)
+        from importlib import import_module
+        module = import_module("." + module_name, __package__)
+        try:
+            overrides = {}
+            if config_flag in args:
+                path = args[config_flag]
+                if not isinstance(path, str) or not path.strip():
+                    raise ValueError("requires a JSON file path")
+                with open(path, encoding="utf-8") as handle:
+                    overrides = json.load(handle)
+                if not isinstance(overrides, dict):
+                    raise ValueError("must contain a JSON object")
+            if flag == "roblox-geometry":
+                overrides["enabled"] = True
+            setattr(engine, settings_key, module.settings(overrides))
+            setattr(engine, enabled_key, True)
+        except (OSError, ValueError, TypeError) as exc:
+            raise _setup_error("Invalid --%s: %s" % (config_flag, exc))
+    if "native-settings" in args:
+        from .native_quality import settings as quality_settings
+        value = args["native-settings"]
+        if not isinstance(value, str) or not value.strip():
+            raise _setup_error("--native-settings requires a JSON file path")
+        try:
+            with open(value, encoding="utf-8") as handle:
+                overrides = json.load(handle)
+            if not isinstance(overrides, dict):
+                raise ValueError("must contain a JSON object")
+            engine.NATIVE_QUALITY = quality_settings(overrides)
+        except (OSError, ValueError, TypeError) as exc:
+            raise _setup_error("Invalid --native-settings: %s" % exc)
+    if "preflight-only" in args and args["preflight-only"] is not True:
+        raise _setup_error("--preflight-only takes no value")
     if "collection" in args:
         # Checked here because select_sources() unexcludes every collection as
         # its first act: a refused run must not have mutated the scene.
@@ -311,13 +357,18 @@ def main() -> None:
     resource_policy = {"enforce": bool(args.get("resource-enforce")),
                        "reserve_fraction": float(args.get("resource-reserve", 0.2)),
                        "device_id": args.get("gpu-device", "")}
+    from . import preflight
+    planned = preflight.analyze(precheck_objects)
+    print("MACHINE|target_preflight|" + json.dumps(planned, sort_keys=True), flush=True)
     resource_check = resources.evaluate_policy(
         resource_policy, {"RES": engine.RES, "MAX_RES": engine.MAX_RES, "DEVICE": engine.DEVICE,
-                          "GPU_DEVICE_ID": engine.GPU_DEVICE_ID},
-        resources.source_statistics(precheck_objects, bpy.data.images, bpy.data.filepath))
+                          "GPU_DEVICE_ID": engine.GPU_DEVICE_ID, "TARGET_PROFILE": engine.TARGET_PROFILE,
+                          "NATIVE_QUALITY": engine.NATIVE_QUALITY}, planned["source_stats"])
     print("MACHINE|resource_admission|" + json.dumps(resource_check, sort_keys=True), flush=True)
     if not resource_check["allowed"]:
         raise _setup_error("Resource admission refused: " + resource_check["reason"])
+    if args.get("preflight-only"):
+        return
     if engine.DONE_LIST and not args.get("no-resume"):
         done_override = args.get("done")
         if done_override and done_override is not True:
