@@ -48,7 +48,7 @@ Requires Blender 4.3 or newer. Restart Blender after replacing an older version 
 ## Documentation
 
 - **[Release notes for 1.6.0](docs/RELEASE_NOTES_1.6.0.md):** the new targets, background jobs, validation results and known limits.
-- **[Quick guide (PDF)](docs/import_glue_quick_guide.pdf):** a two-page visual walkthrough of the four-map workflow, written for 1.4.0.
+- **[Quick guide (PDF)](docs/import_glue_quick_guide.pdf):** a two-page visual walkthrough for 1.6.0: installing, baking in the background, the delivery targets, settings and common fixes.
 - **[User guide](docs/USER_GUIDE.md):** the full manual for the four-map workflow, including the capability report, checkpoints and the visual check. Written for 1.4.0.
 - **[Release notes for 1.4.0](docs/RELEASE_NOTES_1.4.0.md):** what changed between 1.3.0 and 1.4.0.
 - **[Add-on README](import_glue_pbr_baker/README.md):** resolution settings, safety behavior, headless flags, and known engine limits.
